@@ -83,72 +83,6 @@
   {:pre [(= (ticker b) (ticker u))]}
   (reduce update b changes))
 
-;; TODO dynamic is only per thread, so yeah, this is temporary solution for tests.
-;; DO NOT FORGET TO FIX THIS!
-(def ^:dynamic gdax*
-  (atom {}))
-#_
-(add-watch gdax*
-           :watch/books
-           (fn [_ _ _ books]
-             (pprint books)))
-
-#_
-(remove-watch gdax* :watch/books)
-
-(comment
-
-  (def signal-threads* (atom {}))
-
-  (defn signal [books]
-    (let [id (gensym "thread")
-          thread (Thread.
-                  (fn []
-                    (let []
-                      #_(Thread/sleep (rand-int 5))
-                      (let [{:keys [bids asks]}
-                            (:usd/eth @gdax*)
-
-                            signal (doall
-                                    [(some->> bids vals (apply +))
-                                     (some->> asks vals (apply +))])]
-
-                        (if (get @signal-threads* id)
-                          (println (str"signal:" signal))
-                          (println "slow"))))))]
-      (swap! signal-threads*
-             assoc
-             id
-             'active)
-      (.start thread)
-      id))
-
-  (add-watch gdax*
-             :signal/start
-             (fn [_ _ _ books]
-               (signal books)))
-
-  (add-watch gdax*
-             :signal/stop
-             (fn [_ _ _ books]
-               (reset! signal-threads* {})))
-
-  (signal @gdax*)
-  (reset! signal-threads* {})
-  (deref signal-threads*)
-  ;; end
-  )
-
-
-(def ^:dynamic bitfinex*
-  (atom {:channel->ticker {}
-         :ticker->channel {}}))
-#_
-(add-watch bitfinex*
-           :watch/books
-           (fn [_ _ _ books]
-             (pprint books)))
-
 ;;* Connect
 
 (def connections*
@@ -442,60 +376,114 @@
   (println "Skipping heartbeat message"))
 
 (defmethod dispatch :default [_ m]
-  (println "Unknown dispatch"))
-
-(comment
-
-  ;; gdax
-  (def gdax (do (connect :gdax)
-                (subscribe :gdax)))
-
-  ;; TODO build such processing pipeline middleware style?
-  (def gdax-consumer
-    (s/consume (fn [msg]
-                 (->> msg
-                      json/decode
-                      (message :gdax)
-                      (dispatch :gdax)))
-               gdax))
-
-  (s/close! gdax)
-  (s/close! (get-in @connections* [:gdax :conn]))
-  ;; end
+  ;; (println "Unknown dispatch")
   )
 
-(comment
+;;* System
 
-  ;; bitfinex
-  (def bitfinex (do (connect :bitfinex)
-                    (subscribe :bitfinex)))
+;; TODO dynamic is only per thread, so yeah, this is temporary solution for tests.
+;; DO NOT FORGET TO FIX THIS!
 
-  (def bitfinex-consumer
-    (s/consume (fn [msg]
-                 (->> msg
-                      json/decode
-                      (message :bitfinex)
-                      (dispatch :bitfinex)))
-               bitfinex))
+(def ^:dynamic gdax*
+  (atom {}))
 
-  (s/close! bitfinex)
+(def ^:dynamic bitfinex*
+  (atom {:channel->ticker {}
+         :ticker->channel {}}))
 
-  @bitfinex*
+(defn spawn-exchange [exchange-key
+                      & {msg :msg}]
+  (let [thread-control-stream
+        (s/stream)
 
-  ;; subscribe to one more book
-  @(s/put! bitfinex
-           (json/encode
-            {:event "subscribe"
-             :channel "book"
-             :symbol "tETHEUR"
-             :prec "P0"
-             :freq "F0"}))
+        thread
+        (Thread.
+         (fn []
+           (let [stream (do
+                          (connect exchange-key)
+                          (subscribe exchange-key))]
+             (s/consume (fn [msg]
+                          (->> msg
+                               json/decode
+                               (message exchange-key)
+                               (dispatch exchange-key)))
+                        stream)
+             (let [kill-msg @(s/take! thread-control-stream)]
+               (println
+                (format "Killing %s thread" exchange-key))
+               (s/close! thread-control-stream)
+               (println "Closed thread control stream.")
+               (s/close! stream)
+               (println "Closed exchange stream.")))))]
+    (.start thread)
+    {:thread thread
+     :control thread-control-stream}))
 
+(defn spawn-arbitrager [book-ref ticker]
+  (let [thread-control-stream
+        (s/stream)
 
-  (s/close! bitfinex)
-  (s/close! (get-in @connections* [:bitfinex :conn]))
-  ;; end
-  )
+        watcher
+        (gensym "watcher")
+
+        arbitrage
+        (fn arbitrage [arbitrager-ref]
+          (loop []
+            (let [{:keys [bids asks]}
+                  (ticker @book-ref)
+
+                  signal
+                  (doall
+                   [(some->> bids vals (apply +))
+                    (some->> asks vals (apply +))])]
+              (case @arbitrager-ref
+                :late (do (println "late")
+                          (flush)
+                          (reset! arbitrager-ref nil)
+                          (recur))
+                :kill (println "Arbitrager stopped!")
+                ;; else report signal and loop
+                (do (println "signal")
+                    (flush)
+                    (reset! arbitrager-ref nil)
+                    (recur))))))
+
+        thread
+        (Thread.
+         (fn []
+           (let [arbitrager-ref (atom :arbitrage)]
+             ;; compute signal on separate thread
+             (future (arbitrage arbitrager-ref))
+             ;; notify arbitrager of late computations
+             (add-watch book-ref :arbitrager
+                        (fn [_ _ _ _]
+                          (swap! arbitrager-ref
+                                 (fn [v]
+                                   (if (= :kill v)
+                                     v
+                                     :late)))))
+             (loop []
+               (case @(s/take! thread-control-stream)
+                 (do
+                   (println "Killing arbitrager thread")
+                   (reset! arbitrager-ref :kill)
+                   (remove-watch book-ref :arbitrager)
+                   (s/close! thread-control-stream)
+                   (println "Closed thread control stream.")))))))]
+    (.start thread)
+    {:thread thread
+     :control thread-control-stream}))
+
+#_(def gdax (spawn-exchange :gdax))
+#_(deref gdax*)
+#_(s/put! (:control gdax) 'done)
+
+#_(def arbitrager (spawn-arbitrager gdax* :usd/eth))
+#_(s/put! (:control arbitrager) :kill)
+
+#_(def bitfinex (spawn-exchange :bitfinex))
+#_(deref bitfinex*)
+#_(s/put! (:control bitfinex) 'done)
 
 (defn printer [stream & {print-fn :print
                          map-fn :map
