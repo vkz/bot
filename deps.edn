@@ -1,0 +1,6 @@
+{:deps
+ {aleph {:mvn/version "0.4.4"}
+  org.clojure/core.async {:mvn/version "0.4.474"}
+  cheshire {:mvn/version "5.8.0"}}
+ :aliases
+ {:xmlbind {:jvm-opts "--add-modules=java.xml.bind"}}}
