@@ -85,22 +85,32 @@
 
 ;;* Connect
 
+;; TODO dynamic is only per thread, so yeah, this is temporary solution for tests.
+;; DO NOT FORGET TO FIX THIS!
+
+(def ^:dynamic gdax*
+  (atom {}))
+
+(def ^:dynamic bitfinex*
+  (atom {:channel->ticker {}
+         :ticker->channel {}}))
+
 (def connections*
   (atom
    {:gdax     {:url "wss://ws-feed.gdax.com"
                :msg (json/encode
                      {"type"        "subscribe"
-                      "product_ids" ["ETH-USD" "ETH-EUR"]
+                      "product_ids" ["ETH-BTC"]
                       "channels"    ["level2"
                                      "heartbeat"
                                      {"name"        "ticker"
-                                      "product_ids" ["ETH-BTC" "ETH-USD"]}]})
+                                      "product_ids" ["ETH-BTC"]}]})
                :conn nil}
     :bitfinex {:url "wss://api.bitfinex.com/ws/2"
                :msg (json/encode
                      {:event   "subscribe"
                       :channel "book"
-                      :symbol  "tETHUSD"
+                      :symbol  "tETHBTC"
                       :prec    "P0"
                       :freq    "F0"})
                :conn nil}}))
@@ -235,13 +245,14 @@
 (defmethod message [:bitfinex :subscribed] [_ {:keys [pair]
                                                :as m}]
   (letfn [(pair->ticker-pair [s]
-            (case (string/lower-case s)
-              ;; best hardcode pairs of interest
-              "ethusd" {:commodity :eth :currency :usd}
-              "etheur" {:commodity :eth :currency :eur}
-              ;; crude guess
-              {:commodity (keyword (subs "ethusd" 0 3))
-               :currency (keyword (subs "ethusd" 3))}))]
+            (let [s (string/lower-case s)]
+              (case s
+                ;; best hardcode pairs of interest
+                "ethusd" {:commodity :eth :currency :usd}
+                "etheur" {:commodity :eth :currency :eur}
+                ;; crude guess
+                {:commodity (keyword (subs s 0 3))
+                 :currency (keyword (subs s 3))})))]
     (-> m
         (merge (pair->ticker-pair pair)))))
 
@@ -381,16 +392,6 @@
 
 ;;* System
 
-;; TODO dynamic is only per thread, so yeah, this is temporary solution for tests.
-;; DO NOT FORGET TO FIX THIS!
-
-(def ^:dynamic gdax*
-  (atom {}))
-
-(def ^:dynamic bitfinex*
-  (atom {:channel->ticker {}
-         :ticker->channel {}}))
-
 (defn spawn-exchange [exchange-key
                       & {msg :msg}]
   (let [thread-control-stream
@@ -478,33 +479,198 @@
 #_(deref gdax*)
 #_(s/put! (:control gdax) 'done)
 
-#_(def arbitrager (spawn-arbitrager gdax* :usd/eth))
+#_(def arbitrager (spawn-arbitrager gdax* :btc/eth))
 #_(s/put! (:control arbitrager) :kill)
 
 #_(def bitfinex (spawn-exchange :bitfinex))
 #_(deref bitfinex*)
 #_(s/put! (:control bitfinex) 'done)
 
-(defn printer [stream & {print-fn :print
-                         map-fn :map
-                         filter-fn :filter
-                         :or {print-fn pprint
-                              filter-fn identity}}]
-  (let [sink (s/stream)]
-    (->> sink
-         (s/filter filter-fn)
-         (s/map map-fn)
-         (s/consume print-fn))
-    (s/connect stream
-               sink
-               {:description "attached: printer"})
-    ;; create an intermediate stream as a custodian of any operations downstream
-    ;; and return it. Cool thing is that now the caller can simply close that
-    ;; sink, which in theory closes and eventually GSs everything everything we
-    ;; connected to the original stream.
-    sink))
+;;* Arb
+
+;; TODO This is exchange dependent, so really I should pass exchange structures
+;; around and extract relevant books.
+
+(def cost (constantly 0.25))
+
+(defn arb-step [bid-book ask-book]
+  (assert (= (:ticker bid-book)
+             (:ticker ask-book))
+          (str
+           "But expected the same ticker for both books.\n"
+           "Bid book ticker: " (:ticker bid-book) "\n"
+           "Ask book ticker: " (:ticker ask-book)))
+  (let [ticker
+        (:ticker bid-book)
+
+        cost
+        (cost bid-book ask-book)
+
+        {bids :bids}
+        bid-book
+
+        [bid & bids]
+        bids
+
+        [bid-price bid-size]
+        bid
+
+        {asks :asks}
+        ask-book
+
+        [ask & asks]
+        asks
+
+        [ask-price ask-size]
+        ask]
+
+    ;; TODO assumes cost per 1 unit of size e.g. for :btc/eth that would be cost
+    ;; in btc per 1 eth traded. Unless this assumption holds, may need to fix.
+    ;; E.g. cost maybe proportional to a total value traded that is to price*size.
+    (if (> (- bid-price ask-price)
+           cost)
+      ;; arb
+      (let [trade-size
+            (min bid-size
+                 ask-size)
+
+            bid
+            [:buy bid-price (- bid-size trade-size)]
+
+            ask
+            [:sell ask-price (- ask-size trade-size)]
+
+            bid-book
+            (update bid-book
+                    {:type :update
+                     :ticker ticker
+                     :changes [bid]})
+
+            ask-book
+            (update ask-book
+                    {:type :update
+                     :ticker ticker
+                     :changes [ask]})
+
+            buy-at
+            ask-price
+
+            sell-at
+            bid-price]
+
+        {:trade-size trade-size
+         :buy-at     buy-at
+         :sell-at    sell-at
+         :bid-book   bid-book
+         :ask-book   ask-book})
+
+      ;; no arb
+      nil)))
+
+(defn arb [bid-book ask-book]
+  (loop [bid-book bid-book
+         ask-book ask-book
+         trades []]
+    (if-let [trade (arb-step bid-book
+                             ask-book)]
+      (recur (:bid-book trade)
+             (:ask-book trade)
+             (conj trades trade))
+      trades)))
+
+(defn match [arb-trades]
+  {:size    (->> arb-trades
+                 (map :trade-size)
+                 (apply +))
+   :buy-at  (->> arb-trades
+                 (map :buy-at)
+                 (apply max))
+   :sell-at (->> arb-trades
+                 (map :sell-at)
+                 (apply min))
+   :books   (select-keys (last arb-trades)
+                         [:bid-book :ask-book])})
+
+(defn expect-profit [arb-trades]
+  (if (empty? arb-trades)
+    0
+    (let [{bid-book :bid-book
+           ask-book :ask-book}
+          (first arb-trades)
+
+          {currency :currency}
+          (ticker-pair
+           (:ticker bid-book))
+
+          cost
+          (cost bid-book ask-book)]
+      [(->> arb-trades
+            (map (fn [{:keys [sell-at
+                             buy-at
+                             trade-size]}]
+                   (-> (- sell-at buy-at)
+                       (- cost)
+                       (* trade-size))))
+            (apply +))
+       currency])))
 
 ;;* Tests
+
+(deftest arbitrage
+  (let [bid-book (snapshot->book
+                  {:type :snapshot
+                   :commodity :eth
+                   :currency :btc
+                   :bids [[6 1]
+                          [5 4]
+                          [4 1]
+                          [3 10]]
+                   :asks []})
+        ask-book (snapshot->book
+                  {:type :snapshot
+                   :commodity :eth
+                   :currency :btc
+                   :bids []
+                   :asks [[4 2]
+                          [4.5 4]
+                          [5 5]
+                          [6 10]]})]
+
+    (is (=
+         [{:trade-size 1,
+           :buy-at 4,
+           :sell-at 6,
+           :bid-book (map->Book {:ticker :btc/eth, :asks {}, :bids {5 4, 4 1, 3 10}}),
+           :ask-book (map->Book {:ticker :btc/eth, :asks {4 1, 4.5 4, 5 5, 6 10}, :bids {}})}
+          {:trade-size 1,
+           :buy-at 4,
+           :sell-at 5,
+           :bid-book (map->Book {:ticker :btc/eth, :asks {}, :bids {5 3, 4 1, 3 10}}),
+           :ask-book (map->Book {:ticker :btc/eth, :asks {4.5 4, 5 5, 6 10}, :bids {}})}
+          {:trade-size 3,
+           :buy-at 4.5,
+           :sell-at 5,
+           :bid-book (map->Book {:ticker :btc/eth, :asks {}, :bids {4 1, 3 10}}),
+           :ask-book (map->Book {:ticker :btc/eth, :asks {4.5 1, 5 5, 6 10}, :bids {}})}]
+         (arb bid-book
+              ask-book)))
+
+    (is (=
+         {:size 5,
+          :buy-at 4.5,
+          :sell-at 5,
+          :books
+          {:bid-book (map->Book {:ticker :btc/eth, :asks {}, :bids {4 1, 3 10}}),
+           :ask-book (map->Book {:ticker :btc/eth, :asks {4.5 1, 5 5, 6 10}, :bids {}})}}
+         (match
+          (arb bid-book
+               ask-book))))
+
+    (is (=
+         [3.25 :btc]
+         (expect-profit
+          (arb bid-book
+               ask-book))))))
 
 (defmacro with-book [[book-name book-atom-var] &
                      {before :before
