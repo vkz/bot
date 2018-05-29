@@ -491,7 +491,16 @@
 ;; TODO This is exchange dependent, so really I should pass exchange structures
 ;; around and extract relevant books.
 
-(def cost (constantly 0.25))
+(defn with-cost [book side price]
+  ;; TODO exchange+book => fee
+  ;; hardcoding for now
+  (let [taker-fee (/ 0.3 100)
+        ;; withdrawal-fee 0
+        ]
+    (decimal
+     (case side
+       (:buy :ask) (* price (+ 1 taker-fee))
+       (:sell :bid) (* price (- 1 taker-fee))))))
 
 (defn arb-step [bid-book ask-book]
   (assert (= (:ticker bid-book)
@@ -502,9 +511,6 @@
            "Ask book ticker: " (:ticker ask-book)))
   (let [ticker
         (:ticker bid-book)
-
-        cost
-        (cost bid-book ask-book)
 
         {bids :bids}
         bid-book
@@ -527,9 +533,14 @@
     ;; TODO assumes cost per 1 unit of size e.g. for :btc/eth that would be cost
     ;; in btc per 1 eth traded. Unless this assumption holds, may need to fix.
     ;; E.g. cost maybe proportional to a total value traded that is to price*size.
-    (if (> (- bid-price ask-price)
-           cost)
-      ;; arb
+
+    (cond
+
+      (and (some? bid-price)
+           (some? ask-price)
+           (pos?
+            (- (with-cost bid-book :bid bid-price)
+               (with-cost ask-book :ask ask-price))))
       (let [trade-size
             (min bid-size
                  ask-size)
@@ -559,12 +570,12 @@
             bid-price]
 
         {:trade-size trade-size
-         :buy-at     buy-at
-         :sell-at    sell-at
-         :bid-book   bid-book
-         :ask-book   ask-book})
+         :buy-at buy-at
+         :sell-at sell-at
+         :bid-book bid-book
+         :ask-book ask-book})
 
-      ;; no arb
+      :else
       nil)))
 
 (defn arb [bid-book ask-book]
@@ -600,16 +611,13 @@
 
           {currency :currency}
           (ticker-pair
-           (:ticker bid-book))
-
-          cost
-          (cost bid-book ask-book)]
+           (:ticker bid-book))]
       [(->> arb-trades
             (map (fn [{:keys [sell-at
                              buy-at
                              trade-size]}]
-                   (-> (- sell-at buy-at)
-                       (- cost)
+                   (-> (- (with-cost bid-book :sell sell-at)
+                          (with-cost ask-book :buy buy-at))
                        (* trade-size))))
             (apply +))
        currency])))
@@ -635,6 +643,28 @@
                           [4.5 4]
                           [5 5]
                           [6 10]]})]
+
+
+    ;; calculating expected profit by hand for the above two books
+    ;; * size (- sell buy)
+    (is (= 4.3575M
+           (+
+            (* 1 (- (with-cost 'any :sell 6)
+                    (with-cost 'any :buy 4)))
+            (* 1 (- (with-cost 'any :sell 5)
+                    (with-cost 'any :buy 4)))
+            (* 3 (- (with-cost 'any :sell 5)
+                    (with-cost 'any :buy 4.5))))))
+    ;; NOTE incidentally were I to perform this calculation in Clojure's default
+    ;; double instead of decimal I'd get a result with rounding error:
+    ;; 4.3575000000000035, so yeah, don't use float for money!
+
+    (is (= (with-cost 'b :ask 4)
+           (with-cost 'b :buy 4)))
+
+
+    (is (= (with-cost 'b :sell 5)
+           (with-cost 'b :bid 5)))
 
     (is (=
          [{:trade-size 1,
@@ -667,7 +697,7 @@
                ask-book))))
 
     (is (=
-         [3.25 :btc]
+         [4.3575M :btc]
          (expect-profit
           (arb bid-book
                ask-book))))))
