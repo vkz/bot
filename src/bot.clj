@@ -15,7 +15,23 @@
                                   with-test
                                   is are
                                   testing
-                                  use-fixtures]]))
+                                  use-fixtures]])
+  (:import [java.text DateFormat SimpleDateFormat]
+           [java.util Date]))
+
+(defn timestamp []
+  (.format
+   (SimpleDateFormat. "HH:mm:ss")
+   (Date.)))
+
+(defn call-with-period
+  ([f]
+   (call-with-period 5 f))
+  ([sec f]
+   (future
+     (while true
+       (Thread/sleep (* sec 1000))
+       (f)))))
 
 ;;* Orderbook
 
@@ -384,107 +400,13 @@
   (println "Skipping Info message"))
 
 (defmethod dispatch [:bitfinex :heartbeat] [_ _]
-  (println "Skipping heartbeat message"))
+  (println
+   (str (timestamp)
+        " Heartbeat")))
 
 (defmethod dispatch :default [_ m]
   ;; (println "Unknown dispatch")
   )
-
-;;* System
-
-(defn spawn-exchange [exchange-key
-                      & {msg :msg}]
-  (let [thread-control-stream
-        (s/stream)
-
-        thread
-        (Thread.
-         (fn []
-           (let [stream (do
-                          (connect exchange-key)
-                          (subscribe exchange-key))]
-             (s/consume (fn [msg]
-                          (->> msg
-                               json/decode
-                               (message exchange-key)
-                               (dispatch exchange-key)))
-                        stream)
-             (let [kill-msg @(s/take! thread-control-stream)]
-               (println
-                (format "Killing %s thread" exchange-key))
-               (s/close! thread-control-stream)
-               (println "Closed thread control stream.")
-               (s/close! stream)
-               (println "Closed exchange stream.")))))]
-    (.start thread)
-    {:thread thread
-     :control thread-control-stream}))
-
-(defn spawn-arbitrager [book-ref ticker]
-  (let [thread-control-stream
-        (s/stream)
-
-        watcher
-        (gensym "watcher")
-
-        arbitrage
-        (fn arbitrage [arbitrager-ref]
-          (loop []
-            (let [{:keys [bids asks]}
-                  (ticker @book-ref)
-
-                  signal
-                  (doall
-                   [(some->> bids vals (apply +))
-                    (some->> asks vals (apply +))])]
-              (case @arbitrager-ref
-                :late (do (println "late")
-                          (flush)
-                          (reset! arbitrager-ref nil)
-                          (recur))
-                :kill (println "Arbitrager stopped!")
-                ;; else report signal and loop
-                (do (println "signal")
-                    (flush)
-                    (reset! arbitrager-ref nil)
-                    (recur))))))
-
-        thread
-        (Thread.
-         (fn []
-           (let [arbitrager-ref (atom :arbitrage)]
-             ;; compute signal on separate thread
-             (future (arbitrage arbitrager-ref))
-             ;; notify arbitrager of late computations
-             (add-watch book-ref :arbitrager
-                        (fn [_ _ _ _]
-                          (swap! arbitrager-ref
-                                 (fn [v]
-                                   (if (= :kill v)
-                                     v
-                                     :late)))))
-             (loop []
-               (case @(s/take! thread-control-stream)
-                 (do
-                   (println "Killing arbitrager thread")
-                   (reset! arbitrager-ref :kill)
-                   (remove-watch book-ref :arbitrager)
-                   (s/close! thread-control-stream)
-                   (println "Closed thread control stream.")))))))]
-    (.start thread)
-    {:thread thread
-     :control thread-control-stream}))
-
-#_(def gdax (spawn-exchange :gdax))
-#_(deref gdax*)
-#_(s/put! (:control gdax) 'done)
-
-#_(def arbitrager (spawn-arbitrager gdax* :btc/eth))
-#_(s/put! (:control arbitrager) :kill)
-
-#_(def bitfinex (spawn-exchange :bitfinex))
-#_(deref bitfinex*)
-#_(s/put! (:control bitfinex) 'done)
 
 ;;* Arb
 
@@ -502,81 +424,91 @@
        (:buy :ask) (* price (+ 1 taker-fee))
        (:sell :bid) (* price (- 1 taker-fee))))))
 
+;; TODO too slow
 (defn arb-step [bid-book ask-book]
-  (assert (= (:ticker bid-book)
-             (:ticker ask-book))
-          (str
-           "But expected the same ticker for both books.\n"
-           "Bid book ticker: " (:ticker bid-book) "\n"
-           "Ask book ticker: " (:ticker ask-book)))
-  (let [ticker
-        (:ticker bid-book)
 
-        {bids :bids}
-        bid-book
+  (if (not
+       (= (:ticker bid-book)
+          (:ticker ask-book)))
 
-        [bid & bids]
-        bids
+    ;; Can happen if arbitrager thread starts before we book snapshots from
+    ;; exchanges. Should I simply Thread/sleep here?
+    (do (println
+         (str "Ticker mismatch:\n"
+              "- Bid book ticker: " (:ticker bid-book) "\n"
+              "- Ask book ticker: " (:ticker ask-book) "\n"
+              "skipping"))
+        (flush)
+        nil)
 
-        [bid-price bid-size]
-        bid
+    (let [ticker
+          (:ticker bid-book)
 
-        {asks :asks}
-        ask-book
+          {bids :bids}
+          bid-book
 
-        [ask & asks]
-        asks
+          [bid & bids]
+          bids
 
-        [ask-price ask-size]
-        ask]
+          [bid-price bid-size]
+          bid
 
-    ;; TODO assumes cost per 1 unit of size e.g. for :btc/eth that would be cost
-    ;; in btc per 1 eth traded. Unless this assumption holds, may need to fix.
-    ;; E.g. cost maybe proportional to a total value traded that is to price*size.
+          {asks :asks}
+          ask-book
 
-    (cond
+          [ask & asks]
+          asks
 
-      (and (some? bid-price)
-           (some? ask-price)
-           (pos?
-            (- (with-cost bid-book :bid bid-price)
-               (with-cost ask-book :ask ask-price))))
-      (let [trade-size
-            (min bid-size
-                 ask-size)
+          [ask-price ask-size]
+          ask]
 
-            bid
-            [:buy bid-price (- bid-size trade-size)]
+      ;; TODO assumes cost per 1 unit of size e.g. for :btc/eth that would be cost
+      ;; in btc per 1 eth traded. Unless this assumption holds, may need to fix.
+      ;; E.g. cost maybe proportional to a total value traded that is to price*size.
 
-            ask
-            [:sell ask-price (- ask-size trade-size)]
+      (cond
 
-            bid-book
-            (update bid-book
-                    {:type :update
-                     :ticker ticker
-                     :changes [bid]})
+        (and (some? bid-price)
+             (some? ask-price)
+             (pos?
+              (- (with-cost bid-book :bid bid-price)
+                 (with-cost ask-book :ask ask-price))))
+        (let [trade-size
+              (min bid-size
+                   ask-size)
 
-            ask-book
-            (update ask-book
-                    {:type :update
-                     :ticker ticker
-                     :changes [ask]})
+              bid
+              [:buy bid-price (- bid-size trade-size)]
 
-            buy-at
-            ask-price
+              ask
+              [:sell ask-price (- ask-size trade-size)]
 
-            sell-at
-            bid-price]
+              bid-book
+              (update bid-book
+                      {:type :update
+                       :ticker ticker
+                       :changes [bid]})
 
-        {:trade-size trade-size
-         :buy-at buy-at
-         :sell-at sell-at
-         :bid-book bid-book
-         :ask-book ask-book})
+              ask-book
+              (update ask-book
+                      {:type :update
+                       :ticker ticker
+                       :changes [ask]})
 
-      :else
-      nil)))
+              buy-at
+              ask-price
+
+              sell-at
+              bid-price]
+
+          {:trade-size trade-size
+           :buy-at buy-at
+           :sell-at sell-at
+           :bid-book bid-book
+           :ask-book ask-book})
+
+        :else
+        nil))))
 
 (defn arb [bid-book ask-book]
   (loop [bid-book bid-book
@@ -588,6 +520,36 @@
              (:ask-book trade)
              (conj trades trade))
       trades)))
+
+(defn arb? [bid-book ask-book]
+  (when-let [ticker
+             (and (:ticker bid-book)
+                  (:ticker ask-book))]
+    (let [{bids :bids}
+          bid-book
+
+          [bid & bids]
+          bids
+
+          [bid-price bid-size]
+          bid
+
+          {asks :asks}
+          ask-book
+
+          [ask & asks]
+          asks
+
+          [ask-price ask-size]
+          ask]
+
+      (and (some? bid-price)
+           (some? ask-price)
+           (pos?
+            (- bid-price
+               ask-price))
+           (- bid-price
+              ask-price)))))
 
 (defn match [arb-trades]
   {:size    (->> arb-trades
@@ -621,6 +583,130 @@
                        (* trade-size))))
             (apply +))
        currency])))
+
+;;* System
+
+(defn spawn-exchange [exchange-key
+                      & {msg :msg}]
+  (let [thread-control-stream
+        (s/stream)
+
+        thread
+        (Thread.
+         (fn []
+           (let [stream (do
+                          (connect exchange-key)
+                          (subscribe exchange-key))]
+             (s/consume (fn [msg]
+                          (->> msg
+                               json/decode
+                               (message exchange-key)
+                               (dispatch exchange-key)))
+                        stream)
+             (let [kill-msg @(s/take! thread-control-stream)]
+               (println
+                (format "Killing %s thread" exchange-key))
+               (s/close! thread-control-stream)
+               (println "Closed thread control stream.")
+               (s/close! stream)
+               (println "Closed exchange stream.")))))]
+    (.start thread)
+    {:thread thread
+     :control thread-control-stream}))
+
+(defn spawn-arbitrager [bid-book-ref
+                        ask-book-ref
+                        ticker]
+  (let [thread-control-stream
+        (s/stream)
+
+        arbitrage
+        (fn arbitrage [arbitrager-ref]
+          (loop []
+            (reset! arbitrager-ref :reset)
+            (let [arb
+                  (arb? (ticker @bid-book-ref)
+                        (ticker @ask-book-ref))
+
+                  report-arb
+                  (fn []
+                    (when arb
+                      (println arb)
+                      (flush)))
+
+                  ;; trades
+                  ;; (doall
+                  ;;  (arb (get (deref bid-book-ref) ticker)
+                  ;;       (get (deref ask-book-ref) ticker)))
+                  ;;
+                  ;; report-arb
+                  ;; (fn []
+                  ;;   (when-not (empty? trades)
+                  ;;     (pprint
+                  ;;      {:profit (expect-profit trades)
+                  ;;       :trades (->> trades
+                  ;;                    (map #(dissoc % :bid-book))
+                  ;;                    (map #(dissoc % :ask-book)))})
+                  ;;     (flush)))
+                  ]
+              (case @arbitrager-ref
+                ;; :late
+                ;; (do (println "late")
+                ;;     (flush)
+                ;;     (recur))
+
+                :kill
+                (do (println "Arbitrager stopped!")
+                    (flush))
+
+                ;; else report signal and loop
+                (do
+                  (report-arb)
+                  (recur))))))
+
+        thread
+        (Thread.
+         (fn []
+           (let [arbitrager-ref
+                 (atom :arbitrage)
+
+                 arb-future
+                 (future (arbitrage arbitrager-ref))
+
+                 shutdown
+                 (fn shutdown []
+                   (println "Killing arbitrager thread")
+                   (reset! arbitrager-ref :kill)
+                   (deref arb-future)
+                   (remove-watch bid-book-ref :arbitrager)
+                   (remove-watch ask-book-ref :arbitrager)
+                   (s/close! thread-control-stream)
+                   (println "Closed thread control stream."))]
+
+             ;; notify arbitrager of late computations
+             (add-watch bid-book-ref :arbitrager
+                        (fn [_ _ _ _]
+                          (swap! arbitrager-ref
+                                 (fn [v]
+                                   (if (= :kill v)
+                                     v
+                                     :late)))))
+
+             (add-watch ask-book-ref :arbitrager
+                        (fn [_ _ _ _]
+                          (swap! arbitrager-ref
+                                 (fn [v]
+                                   (if (= :kill v)
+                                     v
+                                     :late)))))
+
+             ;; thread control loop, which we don't use atm
+             (loop []
+               (let [control-msg @(s/take! thread-control-stream)]
+                 (shutdown))))))]
+    (.start thread)
+    {:thread thread
+     :control thread-control-stream}))
 
 ;;* Tests
 
@@ -665,6 +751,8 @@
 
     (is (= (with-cost 'b :sell 5)
            (with-cost 'b :bid 5)))
+
+    (is (arb? bid-book ask-book))
 
     (is (=
          [{:trade-size 1,
@@ -886,10 +974,47 @@
 
 ;;* Main
 
-#_
 (defn -main []
-  (let [socket (gdax)]
-    (repl/set-break-handler! (fn []
-                               (println "Closing socket")
-                               (ws/close socket)
-                               (println "Closed!")))))
+  (let [gdax
+        (do
+          (println "Connect to GDAX")
+          (spawn-exchange :gdax))
+
+        bitfinex
+        (do
+          (println "Connect to Bitfinex")
+          (spawn-exchange :bitfinex))
+
+        arbitrager
+        (do
+          (println "Start arbitrager")
+          (spawn-arbitrager bitfinex*
+                            gdax*
+                            :btc/eth))
+
+        ;; books-heartbeat
+        ;; (call-with-period
+        ;;  15
+        ;;  (fn []
+        ;;    (println "GDAX:")
+        ;;    (pprint @gdax*)
+        ;;    (println "Bitfinex:")
+        ;;    (pprint @bitfinex*)
+        ;;    (flush)))
+
+        shutdown
+        (fn [& args]
+          (println "Shutting down")
+          ;; (future-cancel books-heartbeat)
+          (s/put! (:control arbitrager) :kill)
+          (s/put! (:control gdax) 'done)
+          (s/put! (:control bitfinex) 'done)
+          (println "done")
+          (System/exit 0))]
+
+    ;; handle CTRL-C
+    (repl/set-break-handler! shutdown)
+
+    ;; block thread
+    (read-line)
+    (shutdown)))
