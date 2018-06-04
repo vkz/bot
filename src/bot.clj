@@ -1,7 +1,10 @@
 (ns bot
   (:require [cheshire.core :as json]
+            [medley.core :refer :all]
             [clojure.pprint :refer [pprint]]
             [clojure.repl :as repl]
+
+            [taoensso.timbre :as log]
 
             [aleph.http :as http]
             [manifold.stream :as s]
@@ -21,12 +24,12 @@
 
 (defn timestamp []
   (.format
-   (SimpleDateFormat. "HH:mm:ss")
-   (Date.)))
+    (SimpleDateFormat. "HH:mm:ss")
+    (Date.)))
 
-(defn call-with-period
+(defn call-periodically
   ([f]
-   (call-with-period 5 f))
+   (call-periodically 5 f))
   ([sec f]
    (future
      (while true
@@ -175,8 +178,8 @@
             (-> pstr
                 (string/split #"-")
                 (->>
-                 (map string/lower-case)
-                 (map keyword))))
+                  (map string/lower-case)
+                  (map keyword))))
 
           (decimals
             ([side price size]
@@ -993,7 +996,7 @@
                             :btc/eth))
 
         ;; books-heartbeat
-        ;; (call-with-period
+        ;; (call-periodically
         ;;  15
         ;;  (fn []
         ;;    (println "GDAX:")

@@ -1,7 +1,12 @@
 {:deps
- {aleph {:mvn/version "0.4.4"}
+ {aleph                  {:mvn/version "0.4.4"}
   org.clojure/core.async {:mvn/version "0.4.474"}
-  cheshire {:mvn/version "5.8.0"}}
+  cheshire               {:mvn/version "5.8.0"}
+  medley                 {:mvn/version "1.0.0"}
+  com.taoensso/timbre    {:mvn/version "4.10.0"
+                          :exclusions
+                          [[org.clojure/clojure]]}}
+
  :aliases
  {:lispy   {:extra-deps {}}
   :xmlbind {:jvm-opts ["--add-modules=java.xml.bind"]}}}
