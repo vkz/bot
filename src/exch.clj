@@ -23,192 +23,9 @@
            [io.netty.handler.ssl.util
             InsecureTrustManagerFactory]))
 
-;; TODO should I lower-case these?
-(def gdax-products
-  (into
-    #{}
-    (dedupe
-      ["BTC-USD" "ETH-USD" "ETH-BTC" "LTC-USD" "LTC-BTC"
-       "ETH-BTC" "LTC-BTC" "BTC-EUR" "ETH-EUR" "ETH-BTC"
-       "LTC-EUR" "LTC-BTC" "BTC-GBP" "BTC-EUR" "ETH-BTC"
-       "ETH-EUR" "LTC-BTC" "LTC-EUR" "ETH-BTC" "LTC-BTC"])))
+;;* Ticker
 
-(def bitfinex-products
-  #{"tBTCUSD" "tLTCUSD" "tLTCBTC" "tETHUSD" "tETHBTC"
-    "tETCBTC" "tETCUSD" "tRRTUSD" "tRRTBTC" "tZECUSD"
-    "tZECBTC" "tXMRUSD" "tXMRBTC" "tDSHUSD" "tDSHBTC"
-    "tBTCEUR" "tXRPUSD" "tXRPBTC" "tIOTUSD" "tIOTBTC"
-    "tIOTETH" "tEOSUSD" "tEOSBTC" "tEOSETH" "tSANUSD"
-    "tSANBTC" "tSANETH" "tOMGUSD" "tOMGBTC" "tOMGETH"
-    "tBCHUSD" "tBCHBTC" "tBCHETH" "tNEOUSD" "tNEOBTC"
-    "tNEOETH" "tETPUSD" "tETPBTC" "tETPETH" "tQTMUSD"
-    "tQTMBTC" "tQTMETH" "tAVTUSD" "tAVTBTC" "tAVTETH"
-    "tEDOUSD" "tEDOBTC" "tEDOETH" "tBTGUSD" "tBTGBTC"
-    "tDATUSD" "tDATBTC" "tDATETH" "tQSHUSD" "tQSHBTC"
-    "tQSHETH" "tYYWUSD" "tYYWBTC" "tYYWETH" "tGNTUSD"
-    "tGNTBTC" "tGNTETH" "tSNTUSD" "tSNTBTC" "tSNTETH"
-    "tIOTEUR" "tBATUSD" "tBATBTC" "tBATETH" "tMNAUSD"
-    "tMNABTC" "tMNAETH" "tFUNUSD" "tFUNBTC" "tFUNETH"
-    "tZRXUSD" "tZRXBTC" "tZRXETH" "tTNBUSD" "tTNBBTC"
-    "tTNBETH" "tSPKUSD" "tSPKBTC" "tSPKETH" "tTRXUSD"
-    "tTRXBTC" "tTRXETH" "tRCNUSD" "tRCNBTC" "tRCNETH"
-    "tRLCUSD" "tRLCBTC" "tRLCETH" "tAIDUSD" "tAIDBTC"
-    "tAIDETH" "tSNGUSD" "tSNGBTC" "tSNGETH" "tREPUSD"
-    "tREPBTC" "tREPETH" "tELFUSD" "tELFBTC" "tELFETH"})
-
-(defn connect
-  "Establish connection with the exchange.
-  WS API
-  - connection is persistent,
-  - we subscribe to the heartbeat messages,
-  - received messages are transformed to a unified schema,
-  - we create a pub from in-ch with a topic-fn for unified schema,
-  - in-ch, pub, heartbeat subscriber added to the state.
-
-  REST API
-  - we send a test msg and verify exch server response,
-  - start a \"polling\" process with period T,
-  - polling proccess has in-ch where it puts msgs received from exchange,
-  - polling process has queue from which it sends msg every T sec,
-  - polling process has pub from in-ch
-  - we subscribe to heartbeat msgs (proc that adds HB msg to polling queue every 10sec)
-  - received messages are transformed to a unified schema,
-  - we create a pub from channel with a topic-fn for unified schema,
-  - in-ch, queue, pub, heartbeat subscriber added to the state.
-
-  Return
-  - true on success,
-  - nil on failure.
-
-  Connect is idempotent: it should check if connection is already open."
-  [])
-
-(defrecord Connection
-    [in
-     out
-     pub
-     transform-in
-     transform-out
-     proc])
-
-(defn close
-  "
-  (unsub-all (:pub Connection))
-  Close (:in Connection)
-  Close (:out Connection)
-  Stop (:proc Connection)
-  Reset CONN"
-  [Connection])
-
-(defn orderbook-derefer
-  [ticker]
-  (fn orderbook []
-    (-> @BOOKS
-        ticker
-        ;; (agent OrderBook)
-        deref)))
-
-(defn heartbeat-derefer
-  []
-  (fn heartbeat []
-    (-> HEARTBEAT
-        ;; (atom HeartBeat)
-        deref)))
-
-(defn create-orderbook
-  "
-  If OrderBook record for this ticker exists in state, use that.
-
-  Else add fresh OrderBook for ticker with channel ch to state.
-  Create process that updates OrderBook atom every time it gets a msg on ch.
-  Set proc field in OrderBook.
-
-  Return (orderbook-derefer ticker).
-  "
-  ([ticker])
-  ;; custom channel e.g. backed by NoisySlidingBuffer
-  ([ticker ch]))
-
-(defn create-heartbeat
-  "
-  If HEARTBEAT use that.
-
-  Else add fresh HeartBeat with channel ch to HEARTBEAT.
-  Create process that updates timestamp in HeartBeat atom every item it gets a mesg on ch.
-  Set proc field in HeartBeat.
-
-  Return (heartbeat-derefer).")
-
-(defn close
-  "
-  Close (:ch OrderBook).
-  Remove OrderBook from BOOKS.
-  "
-  [OrderBook])
-
-(defn close
-  "
-  Close (:ch HeartBeat).
-  Reset HEARTBEAT."
-  [HeartBeat])
-
-(defn subscribe
-  "Subscribe OrderBook for updates from Exchange:
-
-  WS API
-  - send request for orderbook updates to exch,
-  - (sub pub :topic (:ch OrderBook)),
-  - add subscriber to state.
-
-  REST API
-  - Create proc that adds orderbook update request to polling q every T sec,
-  - (sub pub :topic (:ch OrderBook))
-  - add subscriber to state."
-  ([OrderBook])
-  ([OrderBook T]))
-
-(defn send
-  ""
-  [msg])
-
-(defn unsubscribe
-  "
-  WS
-  - send request to stop orderbook updates to exch,
-  - (unsub pub :topic (:ch OrderBook))
-  - remove subscriber from state.
-
-  REST
-  - stop proc that enqueues orderbook update requests,
-  - (unsub pub :topic (:ch OrderBook)),
-  - remove subscriber from state."
-  [OrderBook])
-
-(defn subscribe
-  "
-  WS API
-  - send :hb subscribtion message to exch,
-  - (sub pub :hb (:ch HeartBeat)),
-  - add subscriber to state.
-
-  REST API
-  - Create proc that adds HB msg to the polling queue every N sec,
-  - (sub pub :hb (:ch HeartBeat)),
-  - add subscriber to state."
-  [HeartBeat])
-
-(defn unsubscribe
-  "
-  WS API
-  - send :hb unsubscribe msg to exch,
-  - (unsub-all pub :hb),
-  - remove subscriber from state.
-
-  REST API
-  - stop proc that queues HB msgs,
-  - (unsub pub :hb (:ch HeartBeat))
-  - remove subscriber from state."
-  [HeartBeat])
+(defrecord Ticker [base quote])
 
 (defprotocol ITicker
   (ticker [t])
@@ -216,99 +33,49 @@
   (commodity [t])
   (currency [t]))
 
-(extend-protocol ITicker
+(extend-type clojure.lang.Keyword
 
-  clojure.lang.Keyword
-  ;; -----------------
+    ITicker
 
-  (ticker [k]
-    (let [base (name k)
-          currency (namespace k)
-          kw (comp keyword
-                   string/lower-case)]
+    (ticker [k]
+      (let [base (name k)
+            currency (namespace k)
+            kw (comp keyword
+                     string/lower-case)]
 
-      (if (and base
-               currency)
+        (if (and base
+                 currency)
 
-        {:base (kw base)
-         :currency (kw currency)}
+          (map->Ticker
+            {:base (kw base)
+             :quote (kw currency)})
 
-        ;; TODO validate against all known pairs
-        (throw
-          (ex-info
-            "Malformed ticker"
-            {:ticker k})))))
+          ;; TODO validate against all known pairs
+          (throw
+            (ex-info
+              "Malformed ticker"
+              {:ticker k})))))
 
-  (base [k]
-    (:base (ticker k)))
+    (base [k]
+      (:base (ticker k)))
 
-  (currency [k]
-    (:currency (ticker k)))
+    (currency [k]
+      (:quote (ticker k)))
 
-  (commodity [k]
-    (base k))
+    (commodity [k]
+      (base k)))
 
-  java.lang.String
-  ;; -------------
+#_
+((juxt ticker base commodity currency) :btc/eth)
 
-  (ticker [s]
-    (let [kw
-          (comp keyword
-                string/lower-case)
-
-          [base currency]
-          (cond
-
-            (gdax-products s)
-            (string/split s #"-")
-
-            (bitfinex-products s)
-            [(subs s 1 4)
-             (subs s 4)]
-
-            :else
-            (throw
-              (ex-info
-                "Unrecognized ticker"
-                {:ticker s})))]
-      {:base (kw base)
-       :currency (kw currency)}))
-
-  (base [s]
-    (:base (ticker s)))
-
-  (currency [s]
-    (:currency (ticker s)))
-
-  (commodity [s]
-    (:base (ticker s))))
-
-(comment
-  ((juxt ticker base commodity currency) :btc/eth)
-  ((juxt ticker base commodity currency) "tETHBTC")
-  ((juxt ticker base commodity currency) "ETH-BTC")
-  (base "ethbtc"))
+;;* Book
 
 (defrecord OrderBook
     [ticker
      bids
-     asks
-     ch
-     proc])
+     asks])
 
-(defrecord HeartBeat
-    [timestamp
-     ch
-     proc])
-
-(defprotocol IProc
-  (send [p])
-  (command [p])
-  (kill [p])
-  (subscribe ([p]) ([p timeframe]))
-  ;; ----------------------------
-  (take [p n])
-  (take-while []))
+;;* Proc
 
 ;; TODO could be worth having a pub for each process where you can substribe to
 ;; peek at the result of each iteration. With no subscribers it will just sit
@@ -319,6 +86,16 @@
      ret
      timeout
      api])
+
+#_
+(defprotocol IProc
+  (send [p])
+  (command [p])
+  (kill [p])
+  (subscribe ([p]) ([p timeframe]))
+  ;; ----------------------------
+  (take [p n])
+  (take-while []))
 
 ;; Process
 ;; - reads msgs from in, which can be a channel or a thunk that returns a channel,
@@ -555,10 +332,18 @@
         (when-let [msg (pop queue)]
           (send msg))))))
 
+(defrecord Connection
+    [in
+     out
+     pub
+     transform-in
+     transform-out
+     proc])
 
 (def ^:private CONNECTION (atom nil))
 
-;; ws
+;;* WS
+
 (defn connect
   [& {in :in
       out :out
@@ -649,6 +434,16 @@
                             :proc connection-stream}))
       (fn [] (deref CONNECTION)))))
 
+#_
+(defn orderbook-derefer
+  [ticker]
+  (fn orderbook []
+    (-> @BOOKS
+        ticker
+        ;; (agent OrderBook)
+        deref)))
+
+#_
 (defn subscribe
   [{in :ch
     ticker :ticker
@@ -842,6 +637,7 @@
   )
 
 
+#_
 (defmethod disconnect :gdax
   [exch]
 
@@ -881,3 +677,137 @@
 
   ;;log name,state,alive,daemon properties for non-daemon threads
   (log/debug (print-threads-str :headers [:name :state :alive :daemon] :pre-fn (partial filter #(false? (:daemon %))))))
+
+;;* Design
+(comment
+
+  (defn connect
+    "Establish connection with the exchange.
+  WS API
+  - connection is persistent,
+  - we subscribe to the heartbeat messages,
+  - received messages are transformed to a unified schema,
+  - we create a pub from in-ch with a topic-fn for unified schema,
+  - in-ch, pub, heartbeat subscriber added to the state.
+
+  REST API
+  - we send a test msg and verify exch server response,
+  - start a \"polling\" process with period T,
+  - polling proccess has in-ch where it puts msgs received from exchange,
+  - polling process has queue from which it sends msg every T sec,
+  - polling process has pub from in-ch
+  - we subscribe to heartbeat msgs (proc that adds HB msg to polling queue every 10sec)
+  - received messages are transformed to a unified schema,
+  - we create a pub from channel with a topic-fn for unified schema,
+  - in-ch, queue, pub, heartbeat subscriber added to the state.
+
+  Return
+  - true on success,
+  - nil on failure.
+
+  Connect is idempotent: it should check if connection is already open."
+    [])
+
+  (defn close
+    "
+  (unsub-all (:pub Connection))
+  Close (:in Connection)
+  Close (:out Connection)
+  Stop (:proc Connection)
+  Reset CONN"
+    [Connection])
+
+  (defn create-orderbook
+    "
+  If OrderBook record for this ticker exists in state, use that.
+
+  Else add fresh OrderBook for ticker with channel ch to state.
+  Create process that updates OrderBook atom every time it gets a msg on ch.
+  Set proc field in OrderBook.
+
+  Return (orderbook-derefer ticker).
+  "
+    ([ticker])
+    ;; custom channel e.g. backed by NoisySlidingBuffer
+    ([ticker ch]))
+
+  (defn create-heartbeat
+    "
+  If HEARTBEAT use that.
+
+  Else add fresh HeartBeat with channel ch to HEARTBEAT.
+  Create process that updates timestamp in HeartBeat atom every item it gets a mesg on ch.
+  Set proc field in HeartBeat.
+
+  Return (heartbeat-derefer).")
+
+  (defn close
+    "
+  Close (:ch OrderBook).
+  Remove OrderBook from BOOKS.
+  "
+    [OrderBook])
+
+  (defn close
+    "
+  Close (:ch HeartBeat).
+  Reset HEARTBEAT."
+    [HeartBeat])
+
+  (defn subscribe
+    "Subscribe OrderBook for updates from Exchange:
+
+  WS API
+  - send request for orderbook updates to exch,
+  - (sub pub :topic (:ch OrderBook)),
+  - add subscriber to state.
+
+  REST API
+  - Create proc that adds orderbook update request to polling q every T sec,
+  - (sub pub :topic (:ch OrderBook))
+  - add subscriber to state."
+    ([OrderBook])
+    ([OrderBook T]))
+
+  (defn send
+    ""
+    [msg])
+
+  (defn unsubscribe
+    "
+  WS
+  - send request to stop orderbook updates to exch,
+  - (unsub pub :topic (:ch OrderBook))
+  - remove subscriber from state.
+
+  REST
+  - stop proc that enqueues orderbook update requests,
+  - (unsub pub :topic (:ch OrderBook)),
+  - remove subscriber from state."
+    [OrderBook])
+
+  (defn subscribe
+    "
+  WS API
+  - send :hb subscribtion message to exch,
+  - (sub pub :hb (:ch HeartBeat)),
+  - add subscriber to state.
+
+  REST API
+  - Create proc that adds HB msg to the polling queue every N sec,
+  - (sub pub :hb (:ch HeartBeat)),
+  - add subscriber to state."
+    [HeartBeat])
+
+  (defn unsubscribe
+    "
+  WS API
+  - send :hb unsubscribe msg to exch,
+  - (unsub-all pub :hb),
+  - remove subscriber from state.
+
+  REST API
+  - stop proc that queues HB msgs,
+  - (unsub pub :hb (:ch HeartBeat))
+  - remove subscriber from state."
+    [HeartBeat]))
