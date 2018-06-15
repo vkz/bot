@@ -7,6 +7,9 @@
   medley                 {:mvn/version "1.0.0"}
   com.taoensso/timbre    {:mvn/version "4.10.0"
                           :exclusions
+                          [[org.clojure/clojure]]}
+  org.clojure/spec.alpha {:mvn/version "0.1.143"
+                          :exclusions
                           [[org.clojure/clojure]]}}
 
  :aliases
