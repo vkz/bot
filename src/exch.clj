@@ -89,6 +89,76 @@
 #_
 ((juxt ticker base commodity currency) :btc/eth)
 
+;;* Messages
+
+(def any (constantly true))
+
+(spec/def ::ticker (partial instance? Ticker))
+(spec/def ::price (partial instance? BigDecimal))
+(spec/def ::size (partial instance? BigDecimal))
+
+(spec/def ::bid
+  (spec/spec
+    (spec/cat :price ::price
+              :size ::size)))
+
+(spec/def ::ask
+  (spec/spec
+    (spec/cat :price ::price
+              :size ::size)))
+
+(spec/def ::bids (spec/* ::bid))
+(spec/def ::asks (spec/* ::ask))
+
+(spec/def ::snapshot
+  (spec/keys :req-un [::bids ::asks]))
+
+(spec/def ::update ::snapshot)
+
+;; TODO I could use multi-spec here, but for what benefit?
+
+(spec/def ::snapshot-msg
+  (tagged-spec :snapshot
+               (spec/keys :req-un [::ticker ::snapshot])))
+
+(spec/def ::update-msg
+  (spec/cat :tag #(= % :update)
+            :payload (spec/keys :req-un [::ticker ::update])))
+
+(defn tagged-spec
+  ([tag]
+   (tagged-spec tag (spec/? any)))
+  ([tag payload-spec]
+   (spec/cat :tag #(= % tag)
+             :payload payload-spec)))
+
+(spec/def ::heartbeat-msg (tagged-spec :heartbeat))
+(spec/def ::error-msg (tagged-spec :error))
+(spec/def ::pause-msg (tagged-spec :pause))
+(spec/def ::resume-msg (tagged-spec :resume))
+(spec/def ::reconnect-msg (tagged-spec :reconnect))
+(spec/def ::info-msg (tagged-spec :info))
+
+(spec/def ::subscribed-msg (tagged-spec :subscribed (spec/keys :req-un [::ticker])))
+(spec/def ::unsubstribed-msg (tagged-spec :unsubscribed (spec/keys :req-un [::ticker])))
+(spec/def ::pong-msg (tagged-spec :pong))
+
+(spec/def ::ack-msg
+  (spec/or :subscribed ::subscribed-msg
+           :unsubscribed ::unsubstribed-msg
+           :pong ::pong-msg))
+
+(spec/def ::drop-msg (tagged-spec :drop (spec/keys :req-un [::reason])))
+
+(spec/def ::message
+  (spec/or :snapshot ::snapshot-msg
+           :update ::update-msg
+           :heartbeat ::heartbeat-msg
+           :error ::error-msg
+           :info ::info-msg
+           :ack ::ack-msg
+           :drop ::drop-msg))
+
 ;;* Book
 
 (defrecord OrderBook
