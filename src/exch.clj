@@ -1,5 +1,6 @@
 (ns exch
   (:require [medley.core :refer :all]
+            [clojure.spec.alpha :as spec]
             ;; aleph HTTPS client is broken for some HTTPS pages e.g. for GDAX
             ;; REST API
             [aleph.http :as http]
@@ -15,13 +16,33 @@
             [clojure.core.async.impl.protocols :refer [Channel]]
             [taoensso.timbre :as log])
 
-  ;; tls
-  (:import [io.netty.handler.ssl
-            SslContext
-            SslContextBuilder]
+  (:import [java.text DateFormat SimpleDateFormat]
+           [java.util Date]))
 
-           [io.netty.handler.ssl.util
-            InsecureTrustManagerFactory]))
+(defn timestamp
+  ([ts]
+   (.format
+     (SimpleDateFormat. "HH:mm:ss:SSS")
+     ts))
+  ([]
+   (timestamp (Date.))))
+
+(comment
+  (timestamp 1511545528111)
+  (timestamp))
+
+(defprotocol Money
+  (decimal [this]))
+
+(extend-protocol Money
+  String
+  (decimal [this] (BigDecimal. this))
+
+  java.lang.Integer
+  (decimal [this] (BigDecimal. this))
+
+  Number
+  (decimal [this] (BigDecimal/valueOf this)))
 
 ;;* Ticker
 

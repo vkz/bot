@@ -14,23 +14,10 @@
             [taoensso.timbre :as log]
 
             [exch :as exch
-             :refer [ticker base commodity currency]]
+             :refer [ticker base commodity currency timestamp
+                     decimal]]
 
-            :reload)
-  (:import [java.text DateFormat SimpleDateFormat]
-           [java.util Date]))
-
-(defn timestamp
-  ([ts]
-   (.format
-     (SimpleDateFormat. "HH:mm:ss:SSS")
-     ts))
-  ([]
-   (timestamp (Date.))))
-
-(comment
-  (timestamp 1511545528111)
-  (timestamp))
+            :reload))
 
 (def URL "wss://api.bitfinex.com/ws/2")
 
