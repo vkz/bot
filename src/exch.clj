@@ -1,6 +1,7 @@
 (ns exch
   (:require [medley.core :refer :all]
             [clojure.spec.alpha :as spec]
+            [clojure.spec.gen.alpha :as gen]
             ;; aleph HTTPS client is broken for some HTTPS pages e.g. for GDAX
             ;; REST API
             [aleph.http :as http]
@@ -42,7 +43,7 @@
   (decimal [this] (BigDecimal. this))
 
   Number
-  (decimal [this] (BigDecimal/valueOf this)))
+  (decimal [this] (decimal (str this))))
 
 ;;* Ticker
 
@@ -93,9 +94,32 @@
 
 (def any (constantly true))
 
-(spec/def ::ticker (partial instance? Ticker))
-(spec/def ::price (partial instance? BigDecimal))
-(spec/def ::size (partial instance? BigDecimal))
+(defn gen-decimal []
+  (gen/fmap
+    #(decimal %)
+    (spec/gen
+      (spec/and number?
+                pos?
+                #(Double/isFinite %)
+                #(not (Double/isNaN %))))))
+
+(defn gen-ticker []
+  (gen/fmap
+    #(ticker %)
+    (spec/gen #{:btc/ltc :usd/btc
+                :eur/eth :btc/zec})))
+
+(spec/def ::ticker
+  (spec/with-gen (partial instance? Ticker)
+    gen-ticker))
+
+(spec/def ::price
+  (spec/with-gen (partial instance? BigDecimal)
+    gen-decimal))
+
+(spec/def ::size
+  (spec/with-gen (partial instance? BigDecimal)
+    gen-decimal))
 
 (spec/def ::bid
   (spec/spec
@@ -117,19 +141,32 @@
 
 ;; TODO I could use multi-spec here, but for what benefit?
 
+(def msg-tags
+  #{:snapshot :update :heartbeat
+    :error :pause :resume :reconnect
+    :info :subscribed :unsubscribed :pong :drop})
+
+(defn tag= [tag]
+  (spec/and msg-tags #(= % tag)))
+
 (spec/def ::snapshot-msg
-  (tagged-spec :snapshot
-               (spec/keys :req-un [::ticker ::snapshot])))
+  (spec/cat :tag (tag= :snapshot)
+            :payload (spec/keys :req-un [::ticker ::snapshot])))
 
 (spec/def ::update-msg
-  (spec/cat :tag #(= % :update)
+  (spec/cat :tag (tag= :update)
             :payload (spec/keys :req-un [::ticker ::update])))
 
 (defn tagged-spec
   ([tag]
-   (tagged-spec tag (spec/? any)))
+   (spec/cat :tag (tag= tag)
+             :payload (spec/?
+                        (spec/with-gen any
+                          (fn []
+                            (gen/map (spec/gen #{:foo :bar :baz})
+                                     (gen/string-alphanumeric)))))))
   ([tag payload-spec]
-   (spec/cat :tag #(= % tag)
+   (spec/cat :tag (tag= tag)
              :payload payload-spec)))
 
 (spec/def ::heartbeat-msg (tagged-spec :heartbeat))
@@ -148,6 +185,13 @@
            :unsubscribed ::unsubstribed-msg
            :pong ::pong-msg))
 
+(spec/def ::reason
+  (spec/with-gen string?
+    (fn []
+      (gen/fmap
+        #(str "Because " %)
+        (gen/string-alphanumeric)))))
+
 (spec/def ::drop-msg (tagged-spec :drop (spec/keys :req-un [::reason])))
 
 (spec/def ::message
@@ -158,6 +202,10 @@
            :info ::info-msg
            :ack ::ack-msg
            :drop ::drop-msg))
+
+#_
+(gen/sample
+  (spec/gen ::message))
 
 ;;* Book
 
