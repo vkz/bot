@@ -1,5 +1,6 @@
 (ns bitfinex
   (:require [clojure.spec.alpha :as spec]
+            [clojure.spec.gen.alpha :as gen]
             [medley.core :refer :all]
             [aleph.http :as http]
             [clj-http.client :as http-client]
@@ -15,7 +16,7 @@
 
             [exch :as exch
              :refer [ticker base commodity currency timestamp
-                     decimal]]
+                     decimal conj-some]]
 
             :reload))
 
@@ -96,6 +97,23 @@
   (base [p] (:base (ticker p)))
   (currency [p] (:quote (ticker p)))
   (commodity [p] (:base (ticker p))))
+
+(def ^:private TICKERS-PAIRS
+  (->> PAIRS
+       (map #(vector (ticker %) %))
+       (into {})))
+
+(def ^:private TICKERS-PRODUCTS
+  (->> PRODUCTS
+       (map #(vector (ticker %) %))
+       (into {})))
+
+(defn product [ticker]
+  (if-some [product (TICKERS-PRODUCTS ticker)]
+    product
+    (do
+      (log/error "Ticker " ticker " does not match any product.")
+      nil)))
 
 #_((juxt ticker base commodity currency) (->Product "tETHBTC"))
 #_((juxt ticker base commodity currency) (->Pair "ETHBTC"))
@@ -223,8 +241,8 @@
 
 ;;* Incomming message parse
 (declare
-  dispatch-msg
-  dispatch-event-msg)
+  convert-msg
+  convert-event-msg)
 
 (defn receive [message]
   (let [msg
@@ -235,6 +253,7 @@
     (if (spec/invalid? msg)
 
       (do
+        ;; log error unrecognized message and drop it - don't break the system
         (log/error
           "Received message did not conform to spec\n"
           (with-out-str
@@ -242,11 +261,11 @@
               ::message
               message))))
 
-      (dispatch-msg msg))))
+      (convert-msg msg))))
 
 ;;** - dispatch by tag
 
-(defmulti dispatch-msg first)
+(defmulti convert-msg first)
 
 (defn add-ticker-or-drop
   [[tag {channel :channel
@@ -261,18 +280,18 @@
                  (assoc :tag tag)
                  (assoc :reason reason))])))
 
-(defmethod dispatch-msg :heartbeat
+(defmethod convert-msg :heartbeat
   [msg]
   (add-ticker-or-drop msg))
 
-(defmethod dispatch-msg :snapshot
+(defmethod convert-msg :snapshot
   [[tag payload]]
   (add-ticker-or-drop
     [tag (update
            payload
            :snapshot snapshot->bids-asks)]))
 
-(defmethod dispatch-msg :update
+(defmethod convert-msg :update
   [[_ {update :update
        :as m}]]
   (add-ticker-or-drop
@@ -280,20 +299,20 @@
      (assoc m :update
             (update->bids-asks [update]))]))
 
-(defmethod dispatch-msg :event [[_ m]]
-  (dispatch-event-msg m))
+(defmethod convert-msg :event [[_ m]]
+  (convert-event-msg m))
 
 ;;** - dispatch by event type
-(defmulti dispatch-event-msg ::event)
+(defmulti convert-event-msg ::event)
 
-(defmethod dispatch-event-msg "pong"
+(defmethod convert-event-msg "pong"
   [{ts ::ts cid ::cid :as m}]
   [:pong
    (-> m
        (assoc :timestamp (timestamp ts))
        (assoc :id cid))])
 
-(defmethod dispatch-event-msg "info"
+(defmethod convert-event-msg "info"
   [{event ::event code ::code msg ::msg :as m}]
   (let [tag
         (case code
@@ -322,7 +341,7 @@
 
     [tag payload]))
 
-(defmethod dispatch-event-msg "subscribed"
+(defmethod convert-event-msg "subscribed"
   [{pair ::pair channel ::chanId :as m}]
   (let [ticker
         (ticker
@@ -333,7 +352,7 @@
     [:subscribed
      (assoc m :ticker ticker)]))
 
-(defmethod dispatch-event-msg "unsubscribed"
+(defmethod convert-event-msg "unsubscribed"
   [{channel ::chanId :as m}]
   (if-let [ticker (get @CHANNELS channel)]
 
@@ -351,7 +370,7 @@
              (assoc :tag :unsubscribed)
              (assoc :reason reason))]))))
 
-(defmethod dispatch-event-msg "error"
+(defmethod convert-event-msg "error"
   [{code ::code msg ::msg :as m}]
   (let [tag
         :error
