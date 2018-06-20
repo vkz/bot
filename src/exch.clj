@@ -20,6 +20,15 @@
   (:import [java.text DateFormat SimpleDateFormat]
            [java.util Date]))
 
+(defn conj-some
+  "Conj a value to a vector, if and only if the value is not nil."
+  ([v val]
+   (if (nil? val) v (conj v val)))
+  ([v val & vals]
+   (reduce conj-some
+           (conj-some v val)
+           vals)))
+
 (defn timestamp
   ([ts]
    (.format
@@ -33,17 +42,29 @@
   (timestamp))
 
 (defprotocol Money
-  (decimal [this]))
+  (decimal [this])
+  (decimal-with-precision [this precision]))
 
 (extend-protocol Money
   String
-  (decimal [this] (BigDecimal. this))
+  (decimal [this]
+    (BigDecimal. this))
+  (decimal-with-precision
+    [this precision]
+    (BigDecimal. this (java.math.MathContext. precision)))
 
   java.lang.Integer
-  (decimal [this] (BigDecimal. this))
+  (decimal [this]
+    (BigDecimal. this))
+  (decimal-with-precision
+    [this precision]
+    (BigDecimal. this (java.math.MathContext. precision)))
 
   Number
-  (decimal [this] (decimal (str this))))
+  (decimal [this]
+    (decimal (str this)))
+  (decimal-with-precision [this precision]
+    (decimal-with-precision (str this) precision)))
 
 ;;* Ticker
 
@@ -96,12 +117,13 @@
 
 (defn gen-decimal []
   (gen/fmap
-    #(decimal %)
+    #(decimal-with-precision % 7)
     (spec/gen
-      (spec/and number?
-                pos?
-                #(Double/isFinite %)
-                #(not (Double/isNaN %))))))
+      (spec/double-in
+        :min 10.0
+        :max 500.0
+        :NaN? false
+        :infinite? false))))
 
 (defn gen-ticker []
   (gen/fmap
@@ -177,12 +199,12 @@
 (spec/def ::info-msg (tagged-spec :info))
 
 (spec/def ::subscribed-msg (tagged-spec :subscribed (spec/keys :req-un [::ticker])))
-(spec/def ::unsubstribed-msg (tagged-spec :unsubscribed (spec/keys :req-un [::ticker])))
+(spec/def ::unsubscribed-msg (tagged-spec :unsubscribed (spec/keys :req-un [::ticker])))
 (spec/def ::pong-msg (tagged-spec :pong))
 
 (spec/def ::ack-msg
   (spec/or :subscribed ::subscribed-msg
-           :unsubscribed ::unsubstribed-msg
+           :unsubscribed ::unsubscribed-msg
            :pong ::pong-msg))
 
 (spec/def ::reason
