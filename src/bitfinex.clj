@@ -459,6 +459,300 @@
        "msg" "Unsubscription failed",
        "code" 10400})))
 
+(def ^:private CONNECTION (atom nil))
+
+(defn connection []
+  (deref CONNECTION))
+
+(defn connect []
+  (or
+    ;; already connected
+    (connection)
+    ;; fresh connection
+    (let [in (a/chan)
+          out (a/chan)
+          pub (a/pub in (fn [[tag {ticker :ticker}]]
+                          (conj-some [tag] ticker)))]
+
+      ;; stub to handle outgoing messages
+      (a/go-loop [msg (a/<! out)]
+        (case (first msg)
+          :stop (do
+                  (reset! CONNECTION nil)
+                  (log/info "Connection stopped."))
+          ;; else
+          (do
+            (log/info "Message sent: " msg)
+            (recur (a/<! out)))))
+
+      (reset! CONNECTION {:in in
+                          :out out
+                          :pub pub}))))
+
+;; TODO prob want a ISender protocol defined in exch that each connection can
+;; implement. Then implementations would dispatch on the message tag and would
+;; know if it needs to send it to a specific REST endpoint.
+(defmulti send-msg (fn [[tag _]] tag))
+
+(defmethod send-msg :subscribe
+  [[_ ticker]]
+  (a/put!
+    (:out (connection))
+    {:event "subscribe"
+     :channel "book"
+     :symbol (:symbol (product ticker))
+     :prec "P0"
+     :freq "F0"}))
+
+(defmethod send-msg :unsubscribe
+  [[_ ticker]]
+  (let [channel
+        (find-first
+          (fn [[_ val]] (= val ticker))
+          @CHANNELS)]
+    (a/put!
+      (:out (connection))
+      {:event "unsubscribe"
+       :chanId channel})))
+
+(defmethod send-msg :default
+  [msg]
+  (a/put!
+    (:out (connection))
+    msg))
+
+(defrecord Book [ticker agent ch])
+#_(defrecord OrderBook [ticker bids asks])
+
+(defn empty-book [ticker]
+  {:ticker ticker
+   :asks (sorted-map-by <)
+   :bids (sorted-map-by >)})
+
+(defn snapshot->book
+  [old_book snapshot]
+  {:ticker (old_book :ticker)
+   :asks (into (sorted-map-by <) (:asks snapshot))
+   :bids (into (sorted-map-by >) (:bids snapshot))})
+
+(defn- update-book-entry [side [price size]]
+  (if (zero? size)
+    (dissoc side price)
+    (assoc side price size)))
+
+(defn update->book
+  [book update]
+  ;; TODO {:post check correct sort?}
+  (-> book
+      (assoc :bids
+             (reduce update-book-entry
+                     (:bids book)
+                     (:bids update)))
+      (assoc :asks
+             (reduce update-book-entry
+                     (:asks book)
+                     (:asks update)))))
+
+#_
+(update->book
+  (snapshot->book
+    (empty-book (ticker :eth/btc))
+    '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
+      :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])})
+  '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
+    :bids ([5M 0M] [2.51M 1M])})
+
+(def ^:private BOOKS
+  ;; ticker => Book
+  (atom {}))
+;; Where each map entry is:
+;;
+;; {ticker (Book. ticker agent ch)}
+;;
+;; where agent is e.g.
+;;
+;; {:ticker ticker
+;;  :asks   {6.96M 7M                      ;best ask
+;;           7.59M 23M}
+;;  :bids   {4M    0.9M                    ;best bid
+;;           2.51M 1M}}
+
+(defmulti book-sub-handle-msg (fn [[tag _] _] tag))
+
+(defmethod book-sub-handle-msg :snapshot
+  [[_ payload] book]
+  (send (:agent book)
+        snapshot->book
+        (:snapshot payload))
+  [:recur])
+
+(defmethod book-sub-handle-msg :update
+  [[_ payload] book]
+  (send (:agent book)
+        update->book
+        (:update payload))
+  [:recur])
+
+(defmethod book-sub-handle-msg :subscribed [_ _]
+  [:recur])
+
+(defmethod book-sub-handle-msg :unsubscribed [_ {ticker :ticker
+                                                 :as book}]
+  (doseq [topic [[:subscribed ticker]
+                 [:unsubscribed ticker]
+                 [:snapshot ticker]
+                 [:update ticker]]]
+    (a/unsub (:pub (connection))
+             topic
+             (:ch book)))
+  [:stop])
+
+(defmethod book-sub-handle-msg :proc
+  [[_ payload] {ticker :ticker
+                :as book}]
+  (case (:command payload)
+    (:stop) (do
+              (log/info
+                "Book " book " subscribtion received :stop command.")
+              ;; unsub so we don't accidentally block the pub
+              (doseq [topic [[:subscribed ticker]
+                             [:unsubscribed ticker]
+                             [:snapshot ticker]
+                             [:update ticker]]]
+                (a/unsub (:pub (connection))
+                         topic
+                         (:ch book)))
+              ;; inform exchange, but we won't handle the unsubscribed confo
+              (send-msg [:unsubscribe ticker])
+              ;; stop proc
+              (conj-some [:stop] (:when payload)))
+
+    ;; else
+    (do
+      (log/error "Unrecognized command in proc " (:command payload))
+      [:recur])))
+
+(defn subscribe-book
+  [{ticker :ticker
+    :as book}]
+
+  (or
+    ;; already subscribed
+    (get @BOOKS ticker)
+
+    ;; subscribe new book
+    (do
+      ;; start proc
+      (a/go
+        (loop [msg (a/<! (:ch book))
+               stop-when (constantly false)]
+          (log/info "Book received " msg)
+
+          (let [[ret arg] (book-sub-handle-msg msg book)]
+            (log/debug "ret and arg" [ret arg])
+            (cond
+              (nil? msg)
+              (do
+                (log/info
+                  "Process updating " ticker " book stopped."
+                  "Book pub was closed.")
+                (swap! @BOOKS dissoc ticker)
+                [:process "stopped"])
+
+              (stop-when msg)
+              (do
+                (log/info "Process updating " ticker " book stopped."
+                          "Last msg " msg " received.")
+                (swap! @BOOKS dissoc ticker)
+                [:process "stopped"])
+
+              :handle-ret-and-continue
+              (case ret
+                :recur (recur
+                         (a/<! (:ch book))
+                         stop-when)
+                :stop (if-some [stop-when arg]
+                        ;; stop the next (stop-when msg) => true
+                        (let [stop-when arg]
+                          (recur
+                            (a/<! (:ch book))
+                            stop-when))
+                        ;; stop immediately
+                        (do
+                          (log/info "Process updating " ticker " book stopped.")
+                          (swap! @BOOKS dissoc ticker)
+                          [:process "stopped"])))))))
+
+      ;; sub to topics
+      (doseq [topic [[:subscribed ticker]
+                     [:unsubscribed ticker]
+                     [:snapshot ticker]
+                     [:update ticker]]]
+
+        (a/sub (:pub (connection))
+               topic
+               (:ch book)))
+
+      ;; send subscribtion msg to exch
+      (send-msg [:subscribe ticker])
+
+      (swap! BOOKS assoc ticker book)
+
+      book)))
+
+(comment
+
+  (connect)
+  (send-msg [:subscribe (ticker :btc/eth)])
+  (send-msg [:unsubscribe (ticker :btc/eth)])
+
+  (a/put! (:ch b) [:proc {:command :stop}])
+  (a/put! (:ch b) [:proc {:command :stop
+                          :when (fn [[tag]] (= tag :unsubscribed))}])
+  (reset! BOOKS (atom {}))
+
+  (subscribe-book
+    (map->Book
+      {:ticker (ticker :usd/btc)
+       :agent (agent (empty-book (ticker :usd/btc)))
+       :ch (a/chan)}))
+
+
+  (def b (get @BOOKS (ticker :usd/btc)))
+
+  (defn topicfn [[tag {ticker :ticker}]]
+    (conj-some [tag] ticker))
+
+  (a/put!
+    (:in (connection))
+    [:subscribed {:ticker (ticker :usd/btc)}])
+
+  ;; snapshot
+  (a/put!
+    (:in (connection))
+    [:snapshot
+     {:ticker (ticker :usd/btc)
+      :snapshot
+      '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
+        :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])}}])
+
+  ;; update
+  (a/put!
+    (:in (connection))
+    [:update
+     {:ticker (ticker :usd/btc)
+      :update
+      '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
+        :bids ([5M 0M] [2.51M 1M])}}])
+
+  (update->book
+    (snapshot->book
+      (empty-book (ticker :eth/btc))
+      '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
+        :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])})
+    '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
+      :bids ([5M 0M] [2.51M 1M])}))
+
 
 ;;* Requests
 
@@ -487,11 +781,3 @@
 ;;   "event": "unsubscribe",
 ;;   "chanId": 6
 ;; }
-
-;;* Books
-(defrecord Book [ticker asks bids channel])
-
-(defn empty-book [ticker]
-  (map->Book {:ticker ticker
-              :asks (sorted-map-by <)
-              :bids (sorted-map-by >)}))
