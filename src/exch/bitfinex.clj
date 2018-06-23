@@ -16,9 +16,7 @@
 
             [exch :as exch
              :refer [ticker base commodity currency timestamp
-                     decimal conj-some]]
-
-            :reload))
+                     decimal conj-some]]))
 
 (def URL "wss://api.bitfinex.com/ws/2")
 
@@ -693,12 +691,51 @@
                topic
                (:ch book)))
 
+      (swap! BOOKS assoc ticker book)
+
       ;; send subscribtion msg to exch
       (send-msg [:subscribe ticker])
 
-      (swap! BOOKS assoc ticker book)
-
       book)))
+
+(defn -main []
+  (let [conn (connect)
+        ticker (ticker :usd/btc)
+
+        book (subscribe-book
+               (map->Book
+                 {:ticker ticker
+                  :agent (agent (empty-book ticker))
+                  :ch (a/chan 100)}))]
+    (add-watch
+      (:agent book)
+      :book-watcher (fn [_ _ _ new-state]
+                      (println "Book updated:")
+                      (pprint new-state)))
+
+    (a/put!
+      (:in (connection))
+      [:subscribed {:ticker ticker}])
+
+    ;; snapshot
+    (a/put!
+      (:in (connection))
+      [:snapshot
+       {:ticker ticker
+        :snapshot
+        '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
+          :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])}}])
+
+    ;; update
+    (a/put!
+      (:in (connection))
+      [:update
+       {:ticker ticker
+        :update
+        '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
+          :bids ([5M 0M] [2.51M 1M])}}])
+
+    (read-line)))
 
 (comment
 
