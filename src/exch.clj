@@ -20,6 +20,7 @@
   (:import [java.text DateFormat SimpleDateFormat]
            [java.util Date]))
 
+;;* Utils
 (defn conj-some
   "Conj a value to a vector, if and only if the value is not nil."
   ([v val]
@@ -41,6 +42,7 @@
   (timestamp 1511545528111)
   (timestamp))
 
+;;* Money
 (defprotocol Money
   (decimal [this])
   (decimal-with-precision [this precision]))
@@ -110,6 +112,202 @@
 
 #_
 ((juxt ticker base commodity currency) :btc/eth)
+
+;;* Connection
+(defprotocol ConnectionProtocol
+  (connect [Conn])
+  (disconnect [Conn])
+  (connected? [Conn])
+  (send-out [Conn msg])
+  ;; for testing: puts msg on the internal :in port
+  (send-in [Conn msg])
+  (conn-name [Conn]))
+
+;;* Book
+(defn empty-book [ticker]
+  {:ticker ticker
+   :asks (sorted-map-by <)
+   :bids (sorted-map-by >)})
+
+(defn snapshot->book
+  [book snapshot]
+  {:ticker (:ticker book)
+   :asks (into (sorted-map-by <) (:asks snapshot))
+   :bids (into (sorted-map-by >) (:bids snapshot))})
+
+(defn- update-book-entry [side [price size]]
+  (if (zero? size)
+    (dissoc side price)
+    (assoc side price size)))
+
+(defn update->book
+  [book update]
+  ;; TODO {:post check correct sort?}
+  (-> book
+      (assoc :bids
+             (reduce update-book-entry
+                     (:bids book)
+                     (:bids update)))
+      (assoc :asks
+             (reduce update-book-entry
+                     (:asks book)
+                     (:asks update)))))
+
+#_
+(update->book
+  (snapshot->book
+    (empty-book (ticker :eth/btc))
+    '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
+      :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])})
+  '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
+    :bids ([5M 0M] [2.51M 1M])})
+
+(defprotocol BookProtocol
+  (-book-sub [Book])
+  ;; (send-msg Conn [:subscribe ticker])
+  (-book-unsub [Book])
+  ;; (send-msg Conn [:unsubscribe ticker])
+  (-book-subscribed? [Book])
+  ;; order-book
+  (-book-bids [Book])
+  (-book-asks [Book])
+  (-book-apply-snapshot [Book snapshot])
+  (-book-apply-update [Book update]))
+
+(defrecord Book [ticker conn agent status]
+  BookProtocol
+  (-book-sub [book] (send-out conn [:subscribe ticker]))
+  (-book-unsub [book] (send-out conn [:unsubscribe ticker]))
+  (-book-subscribed? [book] status)
+  (-book-bids [book] (get @agent :bids))
+  (-book-asks [book] (get @agent :asks))
+  (-book-apply-snapshot [book snapshot] (send agent snapshot->book snapshot) book)
+  (-book-apply-update [book update] (send agent update->book update) book))
+
+(defn create-book [conn ticker]
+  (Book. ticker
+         conn
+         (agent (empty-book ticker))
+         false))
+
+;;* State
+
+(defprotocol StateProtocol
+  (-state-sub [this topic chan])
+  (-state-unsub [this topic chan])
+  (-state-book [this ticker])
+  (-state-add-book [this book])
+  (-state-rm-book [this book]))
+
+;; books:
+;; {ticker => Book}
+;; pub:
+;; (async/pub (conn :in) topic-fn)
+;; subs:
+;; {topic => #{chan}}
+(defrecord State [books pub subs]
+  StateProtocol
+  (-state-sub [state topic chan]
+    (State. books
+            pub
+            (assoc subs
+                   topic
+                   (conj
+                     (or (get subs topic) #{})
+                     chan))))
+  (-state-unsub [this topic chan]
+    (State. books
+            pub
+            (assoc-some subs
+                        topic
+                        (disj
+                          (get subs topic)
+                          chan))))
+  (-state-book [this ticker] (get books ticker))
+  (-state-add-book [this book] (State. (assoc books (:ticker book) book) pub subs))
+  (-state-rm-book [this book] (State. (dissoc books (:ticker book)) pub subs)))
+
+;;* Exch
+
+(defprotocol ExchProtocol
+  (sub [Exch chan topic])
+  (unsub [Exch chan topic])
+  (book [Exch ticker])
+  (add-book [Exch ticker])
+  (rm-book [Exch ticker])
+  (exch-name [Exch]))
+
+(defrecord Exch [connection state]
+  ExchProtocol
+  (sub [exch topic chan]
+    (a/sub (:pub @state) topic chan)
+    (swap! state -state-sub chan topic))
+  (unsub [exch topic chan]
+    (swap! state -state-unsub chan topic)
+    (a/unsub (:pub @state) topic chan))
+  (book [exch ticker] (-state-book @state ticker))
+  (add-book [exch ticker] (swap! state -state-add-book (create-book connection ticker)) exch)
+  (rm-book [exch ticker] (swap! state -state-rm-book (book exch ticker)) exch)
+  (exch-name [exch] (conn-name connection)))
+
+(defn send-to-exch [exch msg]
+  (send-out (:connection exch) msg))
+
+(defn send-from-exch [exch msg]
+  (send-in (:connection exch) msg))
+
+(defn create-exch [conn]
+  (letfn [(topic-fn [[tag payload]]
+            (let [topic (conj-some [tag] (:ticker payload))]
+              (println "Topic " topic)
+              topic))]
+    (Exch. conn
+           (atom
+             (State.
+               ;; books
+               {}
+               ;; pub
+               (a/pub (:in conn) topic-fn)
+               ;; subs
+               {})))))
+
+;;* Standard message handlers
+
+(defmulti handle-msg (fn [exch [tag {ticker :ticker}]]
+                       (log/info
+                         (format
+                           "[Exchange %s] handling msg: %s"
+                           (exch-name exch)
+                           (conj-some [tag] ticker)))
+                       tag))
+
+(defmethod handle-msg :subscribed [exch [_ {ticker :ticker}]]
+  (add-book exch ticker))
+
+(defmethod handle-msg :snapshot [exch [_ {ticker :ticker
+                                          snapshot :snapshot}]]
+  (-book-apply-snapshot (book exch ticker) snapshot))
+
+(defmethod handle-msg :update [exch [_ {ticker :ticker
+                                        update :update}]]
+  (-book-apply-update (book exch ticker) update))
+
+(defmethod handle-msg :unsubscribed [exch [_ {ticker :ticker}]]
+  (rm-book exch ticker))
+
+(defmethod handle-msg :default [exch msg]
+  (log/error "No standard handler for msg " msg))
+
+(defn start-standard-msg-handlers [exch ticker]
+  (let [chan (a/chan 1)]
+    (sub exch [:subscribed ticker] chan)
+    (sub exch [:snapshot ticker] chan)
+    (sub exch [:update ticker] chan)
+    (sub exch [:unsubscribed ticker] chan)
+    (a/go-loop []
+      (when-let [msg (a/<! chan)]
+        (handle-msg exch msg)
+        (recur)))))
 
 ;;* Messages
 
