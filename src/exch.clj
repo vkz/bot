@@ -2,6 +2,7 @@
   (:require [medley.core :refer :all]
             [clojure.spec.alpha :as spec]
             [clojure.spec.gen.alpha :as gen]
+            [clojure.spec.test.alpha :as stest]
             ;; aleph HTTPS client is broken for some HTTPS pages e.g. for GDAX
             ;; REST API
             [aleph.http :as http]
@@ -15,7 +16,11 @@
             [clojure.pprint :refer [pprint]]
             [clojure.core.async :as a]
             [clojure.core.async.impl.protocols :refer [Channel]]
-            [taoensso.timbre :as log])
+            [taoensso.timbre :as log]
+
+            [clojure.test
+             :refer
+             [deftest with-test is are testing use-fixtures]])
 
   (:import [java.text DateFormat SimpleDateFormat]
            [java.util Date]))
@@ -343,16 +348,35 @@
 
 (spec/def ::bid
   (spec/spec
-    (spec/cat :price ::price
-              :size ::size)))
+    (spec/with-gen
+      (spec/cat :price ::price
+                :size ::size)
+      (fn []
+        (gen/tuple
+          (spec/gen ::price)
+          (spec/gen ::size))))))
 
 (spec/def ::ask
   (spec/spec
-    (spec/cat :price ::price
-              :size ::size)))
+    (spec/with-gen
+      (spec/cat :price ::price
+                :size ::size)
+      (fn []
+        (gen/tuple
+          (spec/gen ::price)
+          (spec/gen ::size))))))
 
-(spec/def ::bids (spec/* ::bid))
-(spec/def ::asks (spec/* ::ask))
+(spec/def ::bids (spec/with-gen
+                   (spec/* ::bid)
+                   (fn []
+                     (gen/vector
+                       (spec/gen ::bid)))))
+
+(spec/def ::asks (spec/with-gen
+                   (spec/* ::ask)
+                   (fn []
+                     (gen/vector
+                       (spec/gen ::ask)))))
 
 (spec/def ::snapshot
   (spec/keys :req-un [::bids ::asks]))
@@ -422,6 +446,8 @@
            :info ::info-msg
            :ack ::ack-msg
            :drop ::drop-msg))
+
+(def message-gen (gen/fmap vec (spec/gen ::message)))
 
 #_
 (gen/sample
