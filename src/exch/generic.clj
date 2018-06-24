@@ -9,7 +9,7 @@
    [clojure.core.async.impl.protocols :refer [closed?] :rename {closed? chan-closed?}]
    [taoensso.timbre :as log]))
 
-(require '[exch :as exch :only [conj-some]] :reload)
+(require '[exch :as exch :refer [conj-some]] :reload)
 
 (declare send-msg)
 

@@ -75,48 +75,50 @@
 
 ;;* Ticker
 
-(defrecord Ticker [base quote])
-
 (defprotocol ITicker
   (ticker [t])
   (base [t])
   (commodity [t])
-  (currency [t]))
+  (currency [t])
+  (ticker-kw [t]))
+
+(defrecord Ticker [base quote]
+  ITicker
+  (ticker [t] t)
+  (base [t] (:base t))
+  (currency [t] (:quote t))
+  (commodity [t] (:base t))
+  (ticker-kw [t] (keyword (name (:quote t)) (name (:base t)))))
 
 (extend-type clojure.lang.Keyword
 
-    ITicker
+  ITicker
+  (ticker [k]
+    (let [base (name k)
+          currency (namespace k)
+          kw (comp keyword
+                   string/lower-case)]
 
-    (ticker [k]
-      (let [base (name k)
-            currency (namespace k)
-            kw (comp keyword
-                     string/lower-case)]
+      (if (and base
+               currency)
 
-        (if (and base
-                 currency)
+        (map->Ticker
+          {:base (kw base)
+           :quote (kw currency)})
 
-          (map->Ticker
-            {:base (kw base)
-             :quote (kw currency)})
+        ;; TODO validate against all known pairs
+        (throw
+          (ex-info
+            "Malformed ticker"
+            {:ticker k})))))
+  (base [k] (:base (ticker k)))
+  (currency [k] (:quote (ticker k)))
+  (commodity [k] (base k))
+  (ticker-kw [k] k))
 
-          ;; TODO validate against all known pairs
-          (throw
-            (ex-info
-              "Malformed ticker"
-              {:ticker k})))))
 
-    (base [k]
-      (:base (ticker k)))
-
-    (currency [k]
-      (:quote (ticker k)))
-
-    (commodity [k]
-      (base k)))
-
-#_
-((juxt ticker base commodity currency) :btc/eth)
+#_((juxt ticker-kw ticker base commodity currency) :usd/btc)
+#_((juxt ticker-kw ticker base commodity currency) (ticker :usd/btc))
 
 ;;* Connection
 (defprotocol ConnectionProtocol
