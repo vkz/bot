@@ -238,8 +238,8 @@
 ;;* Exch
 
 (defprotocol ExchProtocol
-  (sub [Exch chan topic])
-  (unsub [Exch chan topic])
+  (sub [Exch topic chan])
+  (unsub [Exch topic chan])
   (add-book [Exch ticker])
   (rm-book [Exch ticker])
   (get-book [Exch ticker])
@@ -249,9 +249,9 @@
   ExchProtocol
   (sub [exch topic chan]
     (a/sub (:pub @state) topic chan)
-    (swap! state -state-sub chan topic))
+    (swap! state -state-sub topic chan))
   (unsub [exch topic chan]
-    (swap! state -state-unsub chan topic)
+    (swap! state -state-unsub topic chan)
     (a/unsub (:pub @state) topic chan))
   (add-book [exch ticker]
     (when-not (-state-book @state ticker)
