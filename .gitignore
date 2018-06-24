@@ -1,5 +1,4 @@
 /.cpcache
 /.nrepl-port
-/src/cljs
 /target
 /src/scratch.clj

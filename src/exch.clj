@@ -158,36 +158,37 @@
                      (:asks book)
                      (:asks update)))))
 
-#_
-(update->book
-  (snapshot->book
-    (empty-book (ticker :eth/btc))
-    '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
-      :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])})
-  '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
-    :bids ([5M 0M] [2.51M 1M])})
-
 (defprotocol BookProtocol
   (-book-sub [Book])
-  ;; (send-msg Conn [:subscribe ticker])
   (-book-unsub [Book])
-  ;; (send-msg Conn [:unsubscribe ticker])
   (-book-subscribed? [Book])
-  ;; order-book
-  (-book-bids [Book])
-  (-book-asks [Book])
   (-book-apply-snapshot [Book snapshot])
-  (-book-apply-update [Book update]))
+  (-book-apply-update [Book update])
+  (snapshot [Book])
+  (bids [Book])
+  (asks [Book])
+  ;; callback: fn [old-val new-val]
+  (watch [Book key callback])
+  (unwatch [Book key]))
 
 (defrecord Book [ticker conn agent status]
   BookProtocol
   (-book-sub [book] (send-out conn [:subscribe ticker]))
   (-book-unsub [book] (send-out conn [:unsubscribe ticker]))
   (-book-subscribed? [book] status)
-  (-book-bids [book] (get @agent :bids))
-  (-book-asks [book] (get @agent :asks))
   (-book-apply-snapshot [book snapshot] (send agent snapshot->book snapshot) book)
-  (-book-apply-update [book update] (send agent update->book update) book))
+  (-book-apply-update [book update] (send agent update->book update) book)
+  (snapshot [book] @agent)
+  (bids [book] (get @agent :bids))
+  (asks [book] (get @agent :asks))
+  (watch [book key callback]
+    (add-watch
+      agent
+      key
+      (fn [_ _ old-book new-book]
+        (callback old-book new-book))))
+  (unwatch [book key]
+    (remove-watch agent key)))
 
 (defn create-book [conn ticker]
   (Book. ticker
@@ -237,9 +238,9 @@
 (defprotocol ExchProtocol
   (sub [Exch chan topic])
   (unsub [Exch chan topic])
-  (book [Exch ticker])
   (add-book [Exch ticker])
   (rm-book [Exch ticker])
+  (get-book [Exch ticker])
   (exch-name [Exch]))
 
 (defrecord Exch [connection state]
@@ -250,9 +251,14 @@
   (unsub [exch topic chan]
     (swap! state -state-unsub chan topic)
     (a/unsub (:pub @state) topic chan))
-  (book [exch ticker] (-state-book @state ticker))
-  (add-book [exch ticker] (swap! state -state-add-book (create-book connection ticker)) exch)
-  (rm-book [exch ticker] (swap! state -state-rm-book (book exch ticker)) exch)
+  (add-book [exch ticker]
+    (when-not (-state-book @state ticker)
+      (swap! state -state-add-book (create-book connection ticker)))
+    exch)
+  (rm-book [exch ticker] (swap! state -state-rm-book (get-book exch ticker)) exch)
+  (get-book [exch ticker] (or (-state-book @state ticker)
+                              (do (add-book exch ticker)
+                                  (get-book exch ticker))))
   (exch-name [exch] (conn-name connection)))
 
 (defn send-to-exch [exch msg]
@@ -276,7 +282,7 @@
                ;; subs
                {})))))
 
-;;* Standard message handlers
+;;* Standard handlers
 
 (defmulti handle-msg (fn [exch [tag {ticker :ticker}]]
                        (log/info
@@ -291,11 +297,11 @@
 
 (defmethod handle-msg :snapshot [exch [_ {ticker :ticker
                                           snapshot :snapshot}]]
-  (-book-apply-snapshot (book exch ticker) snapshot))
+  (-book-apply-snapshot (get-book exch ticker) snapshot))
 
 (defmethod handle-msg :update [exch [_ {ticker :ticker
                                         update :update}]]
-  (-book-apply-update (book exch ticker) update))
+  (-book-apply-update (get-book exch ticker) update))
 
 (defmethod handle-msg :unsubscribed [exch [_ {ticker :ticker}]]
   (rm-book exch ticker))
