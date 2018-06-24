@@ -1,4 +1,4 @@
-(ns exch.generic
+(ns generic
   (:require
    [medley.core :refer :all]
    [manifold.stream :as s]

@@ -12,13 +12,19 @@
             [clojure.pprint :refer [pprint]]
             [clojure.core.async :as a]
             [clojure.core.async.impl.protocols :refer [Channel]]
-            [taoensso.timbre :as log]
+            [taoensso.timbre :as log]))
 
-            [exch :as exch
-             :refer [ticker base commodity currency timestamp
-                     decimal conj-some]]))
+(require '[exch :as exch
+           :refer
+           [ticker ticker-kw base commodity currency
+            timestamp decimal conj-some]]
+         :reload)
 
-(def URL "wss://api.bitfinex.com/ws/2")
+;;* Utils & constants
+
+(def ^:private NSNAME (str (ns-name *ns*)))
+
+(def ^:private URL "wss://api.bitfinex.com/ws/2")
 
 (def ^:private pairs
   #{"BTCUSD" "LTCUSD" "LTCBTC" "ETHUSD" "ETHBTC"
@@ -77,6 +83,7 @@
   (base [p] (:base (ticker p)))
   (currency [p] (:quote (ticker p)))
   (commodity [p] (:base (ticker p)))
+  (ticker-kw [p] (ticker-kw (ticker p)))
 
   Product
 
@@ -94,7 +101,8 @@
          :quote (kw qt)})))
   (base [p] (:base (ticker p)))
   (currency [p] (:quote (ticker p)))
-  (commodity [p] (:base (ticker p))))
+  (commodity [p] (:base (ticker p)))
+  (ticker-kw [p] (ticker-kw (ticker p))))
 
 (def ^:private TICKERS-PAIRS
   (->> PAIRS
@@ -106,59 +114,111 @@
        (map #(vector (ticker %) %))
        (into {})))
 
-(defn product [ticker]
+(defn- product [ticker]
   (if-some [product (TICKERS-PRODUCTS ticker)]
     product
     (do
       (log/error "Ticker " ticker " does not match any product.")
       nil)))
 
-#_((juxt ticker base commodity currency) (->Product "tETHBTC"))
-#_((juxt ticker base commodity currency) (->Pair "ETHBTC"))
+#_((juxt ticker ticker-kw base commodity currency) (->Product "tETHBTC"))
+#_((juxt ticker ticker-kw base commodity currency) (->Pair "ETHBTC"))
 
-(defn snapshot->bids-asks [payload]
-  (let [{:keys [bids asks]}
-        (group-by (fn [{:keys [price size]}]
-                    (if (neg? size)
-                      :asks
-                      :bids))
-                  payload)
+;;* State
 
-        bids
-        (map (fn [{:keys [price size]}]
-               [(decimal price)
-                (decimal size)])
-             bids)
+(declare send-msg receive-msg)
 
-        asks
-        (map (fn [{:keys [price size]}]
-               [(decimal price)
-                (decimal (- 0 size))])
-             asks)]
-    {:bids bids
-     :asks asks}))
+(defprotocol StateProtocol
+  (chan-of-ticker [state ticker])
+  (ticker-of-chan [state chan])
+  (add-chan [state chan ticker])
+  (rm-chan [state chan])
+  (toggle-status [state]))
 
-(defn update->bids-asks [payload]
-  (snapshot->bids-asks payload))
+(defrecord State [stream channels tickers status]
+  StateProtocol
+  (chan-of-ticker [state ticker] (get tickers ticker))
+  (ticker-of-chan [state chan] (get channels chan))
+  (add-chan [state chan ticker]
+    (State.
+      stream
+      (assoc channels chan ticker)
+      (assoc tickers ticker chan)
+      status))
+  (rm-chan [state chan]
+    (let [ticker (get channels chan)]
+      (State.
+        stream
+        (dissoc channels chan)
+        (dissoc tickers ticker)
+        status)))
+  (toggle-status [state] (State. stream channels tickers (not status))))
 
-#_
-(=
-  (snapshot->bids-asks
-    [{:price 584.58, :orders 11, :size 65.64632441}
-     {:price 584.51, :orders 1, :size 0.93194317}
-     {:price 584.59, :orders 4, :size -23.39216286}
-     {:price 584.96, :orders 1, :size -7.23746288}
-     {:price 584.97, :orders 1, :size -12.3}])
+(defn clean-state [] (State. nil {} {} false))
 
-  '{:bids ([584.58M 65.64632441M]
-           [584.51M 0.93194317M])
-    :asks ([584.59M 23.39216286M]
-           [584.96M 7.23746288M]
-           [584.97M 12.3M])})
+;;* Connection
 
-(def ^:private CHANNELS (atom {}))
+(defrecord Connection [in out state]
+  StateProtocol
+  (chan-of-ticker [conn ticker] (chan-of-ticker @state ticker))
+  (ticker-of-chan [conn chan] (ticker-of-chan @state chan))
+  (add-chan [conn chan ticker] (swap! state add-chan chan ticker) conn)
+  (rm-chan [conn chan] (swap! state rm-chan chan) conn)
+  (toggle-status [conn] (swap! state toggle-status) conn)
 
-;;* Responses
+  exch/ConnectionProtocol
+  (connect [conn]
+    (let [exch-stream
+          @(http/websocket-client
+             URL
+             {:max-frame-payload 1e6
+              :max-frame-size 1e6})
+
+          in-stream
+          ;; sink of msgs from exchange for users to consume
+          (s/->sink in)
+
+          out-stream
+          ;; source of user msgs to send to exchange
+          (s/->source out)
+
+          _
+          ;; exchange <= out <= user
+          (s/connect-via out-stream json/encode exch-stream)
+
+          _
+          ;; exchange => in => user
+          (s/connect-via exch-stream
+                         (fn [msg]
+                           (receive-msg
+                             conn
+                             (json/decode
+                               #(keyword NSNAME %))))
+                         in-stream)]
+      (Connection.
+        in
+        out
+        (atom
+          (State. exch-stream {} {} true)))))
+  (disconnect [conn]
+    (a/close! in)
+    (toggle-status conn))
+  (connected? [conn] (:status @state))
+  (send-out [conn msg]
+    (send-msg conn msg))
+  ;; for testing: puts msg on the internal :in port
+  (send-in [conn msg]
+    (a/put!
+      (:in conn)
+      (receive-msg conn msg)))
+  (conn-name [conn] (keyword NSNAME)))
+
+(defn create-connection []
+  (let [in (a/chan 1)
+        out (a/chan 1)]
+    (Connection. in out (atom (clean-state)))))
+
+;;* Message specs
 
 ;; NOTE Caution with spec/def registry names. If it ever matches a key in a map
 ;; that you conform against spec will be checked recursively which may lead to
@@ -171,9 +231,7 @@
       (json/decode
         ;; TODO whould *ns* work as expected when this fn is requried elsewhere?
         ;; E.g. gdax namespace etc.
-        #(keyword (str (ns-name *ns*)) %))))
-
-;;* Incomming message specs
+        #(keyword NSNAME %))))
 
 ;;** - update
 (spec/def ::update
@@ -237,12 +295,13 @@
     :snapshot ::snapshot-msg
     :update ::update-msg))
 
-;;* Incomming message parse
+;;* Message receive
 (declare
   convert-msg
   convert-event-msg)
 
-(defn receive [message]
+
+(defn receive-msg [conn message]
   (let [msg
         (spec/conform
           ::message
@@ -259,16 +318,16 @@
               ::message
               message))))
 
-      (convert-msg msg))))
+      (convert-msg conn msg))))
 
 ;;** - dispatch by tag
 
-(defmulti convert-msg first)
+(defmulti convert-msg (fn [conn [tag]] (println "tag " tag) tag))
 
 (defn add-ticker-or-drop
-  [[tag {channel :channel
-         :as m}]]
-  (if-let [ticker (get @CHANNELS channel)]
+  [conn [tag {channel :channel
+              :as m}]]
+  (if-let [ticker (ticker-of-chan conn channel)]
 
     [tag (assoc m :ticker ticker)]
 
@@ -279,39 +338,81 @@
                  (assoc :reason reason))])))
 
 (defmethod convert-msg :heartbeat
-  [msg]
-  (add-ticker-or-drop msg))
+  [conn msg]
+  (add-ticker-or-drop conn msg))
+
+(defn- snapshot->bids-asks [payload]
+  (let [{:keys [bids asks]}
+        (group-by (fn [{:keys [price size]}]
+                    (if (neg? size)
+                      :asks
+                      :bids))
+                  payload)
+
+        bids
+        (map (fn [{:keys [price size]}]
+               [(decimal price)
+                (decimal size)])
+             bids)
+
+        asks
+        (map (fn [{:keys [price size]}]
+               [(decimal price)
+                (decimal (- 0 size))])
+             asks)]
+    {:bids bids
+     :asks asks}))
+
+(defn- update->bids-asks [payload]
+  (snapshot->bids-asks payload))
+
+#_
+(=
+  (snapshot->bids-asks
+    [{:price 584.58, :orders 11, :size 65.64632441}
+     {:price 584.51, :orders 1, :size 0.93194317}
+     {:price 584.59, :orders 4, :size -23.39216286}
+     {:price 584.96, :orders 1, :size -7.23746288}
+     {:price 584.97, :orders 1, :size -12.3}])
+
+  '{:bids ([584.58M 65.64632441M]
+           [584.51M 0.93194317M])
+    :asks ([584.59M 23.39216286M]
+           [584.96M 7.23746288M]
+           [584.97M 12.3M])})
 
 (defmethod convert-msg :snapshot
-  [[tag payload]]
+  [conn [tag payload]]
   (add-ticker-or-drop
+    conn
     [tag (update
            payload
            :snapshot snapshot->bids-asks)]))
 
 (defmethod convert-msg :update
-  [[_ {update :update
-       :as m}]]
+  [conn [_ {update :update
+            :as m}]]
   (add-ticker-or-drop
+    conn
     [:update
      (assoc m :update
             (update->bids-asks [update]))]))
 
-(defmethod convert-msg :event [[_ m]]
-  (convert-event-msg m))
+(defmethod convert-msg :event [conn [_ m]]
+  (convert-event-msg conn m))
 
 ;;** - dispatch by event type
-(defmulti convert-event-msg ::event)
+(defmulti convert-event-msg (fn [conn msg] (::event msg)))
 
 (defmethod convert-event-msg "pong"
-  [{ts ::ts cid ::cid :as m}]
+  [conn {ts ::ts cid ::cid :as m}]
   [:pong
    (-> m
        (assoc :timestamp (timestamp ts))
        (assoc :id cid))])
 
 (defmethod convert-event-msg "info"
-  [{event ::event code ::code msg ::msg :as m}]
+  [conn {event ::event code ::code msg ::msg :as m}]
   (let [tag
         (case code
           20051 :reconnect
@@ -340,22 +441,22 @@
     [tag payload]))
 
 (defmethod convert-event-msg "subscribed"
-  [{pair ::pair channel ::chanId :as m}]
+  [conn {pair ::pair channel ::chanId :as m}]
   (let [ticker
         (ticker
           (->Pair pair))]
 
-    (swap! CHANNELS assoc channel ticker)
+    (add-chan conn channel ticker)
     (log/info "Subscribed to ticker " ticker)
     [:subscribed
      (assoc m :ticker ticker)]))
 
 (defmethod convert-event-msg "unsubscribed"
-  [{channel ::chanId :as m}]
-  (if-let [ticker (get @CHANNELS channel)]
+  [conn {channel ::chanId :as m}]
+  (if-let [ticker (ticker-of-chan conn channel)]
 
     (do
-      (swap! CHANNELS dissoc channel)
+      (rm-chan conn channel)
       (log/info "Unsubscribed ticker " ticker)
       [:unsubscribed
        (assoc m :ticker ticker)])
@@ -369,7 +470,7 @@
              (assoc :reason reason))]))))
 
 (defmethod convert-event-msg "error"
-  [{code ::code msg ::msg :as m}]
+  [conn {code ::code msg ::msg :as m}]
   (let [tag
         :error
 
@@ -384,118 +485,17 @@
 
     [tag payload]))
 
-(comment
-
-  (spec/conform
-    :exch/message
-    (receive
-      '(5863
-         [[584.58 11 65.64632441]
-          [584.51 1 0.93194317]
-          [584.59 4 -23.39216286]
-          [584.96 1 -7.23746288]
-          [584.97 1 -12.3]])))
-
-  (receive
-      '(5863
-         [[584.58 11 65.64632441]
-          [584.51 1 0.93194317]
-          [584.59 4 -23.39216286]
-          [584.96 1 -7.23746288]
-          [584.97 1 -12.3]]))
-
-  (receive
-    '(5863
-       [584.58 11 65.64632441]))
-
-  (receive
-    '(5863 "hb"))
-
-  (receive
-    (map-json-map
-      {"event" "pong",
-       "ts" 1511545528111,
-       "cid" 1234}))
-
-  (receive
-    (map-json-map
-      {"event" "info",
-       "code" 20060,
-       "msg" "Entering Maintenance mode."}))
-  [:resume ...]
-  [:reconnect ...]
-
-
-  (receive
-    (map-json-map
-      {"event" "info",
-       "code" 20017,
-       "msg" "Foo"}))
-
-  (receive
-    (map-json-map
-      {"event" "info",
-       "version" 2,
-       "serverId" "90788dae-4b28-4f4f-963f-364c33e587d2",
-       "platform" {"status" 1}}))
-
-  (receive
-    (map-json-map
-      {"event" "subscribed",
-       "pair" "ETHUSD"
-       "chanId" 5863}))
-
-  (receive
-    (map-json-map
-      {"event" "unsubscribed",
-       "status" "OK",
-       "chanId" 5863}))
-
-  (receive
-    (map-json-map
-      {"event" "error",
-       "msg" "Unsubscription failed",
-       "code" 10400})))
-
-(def ^:private CONNECTION (atom nil))
-
-(defn connection []
-  (deref CONNECTION))
-
-(defn connect []
-  (or
-    ;; already connected
-    (connection)
-    ;; fresh connection
-    (let [in (a/chan)
-          out (a/chan)
-          pub (a/pub in (fn [[tag {ticker :ticker}]]
-                          (conj-some [tag] ticker)))]
-
-      ;; stub to handle outgoing messages
-      (a/go-loop [msg (a/<! out)]
-        (case (first msg)
-          :stop (do
-                  (reset! CONNECTION nil)
-                  (log/info "Connection stopped."))
-          ;; else
-          (do
-            (log/info "Message sent: " msg)
-            (recur (a/<! out)))))
-
-      (reset! CONNECTION {:in in
-                          :out out
-                          :pub pub}))))
+;;* Message send
 
 ;; TODO prob want a ISender protocol defined in exch that each connection can
 ;; implement. Then implementations would dispatch on the message tag and would
 ;; know if it needs to send it to a specific REST endpoint.
-(defmulti send-msg (fn [[tag _]] tag))
+(defmulti send-msg (fn [conn [tag _]] tag))
 
 (defmethod send-msg :subscribe
-  [[_ ticker]]
+  [conn [_ ticker]]
   (a/put!
-    (:out (connection))
+    (:out conn)
     {:event "subscribe"
      :channel "book"
      :symbol (:symbol (product ticker))
@@ -503,318 +503,21 @@
      :freq "F0"}))
 
 (defmethod send-msg :unsubscribe
-  [[_ ticker]]
-  (let [channel
-        (find-first
-          (fn [[_ val]] (= val ticker))
-          @CHANNELS)]
+  [conn [_ ticker]]
+  (let [channel (chan-of-ticker conn ticker)]
     (a/put!
-      (:out (connection))
+      (:out conn)
       {:event "unsubscribe"
        :chanId channel})))
 
 (defmethod send-msg :default
-  [msg]
+  [conn msg]
   (a/put!
-    (:out (connection))
+    (:out conn)
     msg))
-
-(defrecord Book [ticker agent ch])
-#_(defrecord OrderBook [ticker bids asks])
-
-(defn empty-book [ticker]
-  {:ticker ticker
-   :asks (sorted-map-by <)
-   :bids (sorted-map-by >)})
-
-(defn snapshot->book
-  [old_book snapshot]
-  {:ticker (old_book :ticker)
-   :asks (into (sorted-map-by <) (:asks snapshot))
-   :bids (into (sorted-map-by >) (:bids snapshot))})
-
-(defn- update-book-entry [side [price size]]
-  (if (zero? size)
-    (dissoc side price)
-    (assoc side price size)))
-
-(defn update->book
-  [book update]
-  ;; TODO {:post check correct sort?}
-  (-> book
-      (assoc :bids
-             (reduce update-book-entry
-                     (:bids book)
-                     (:bids update)))
-      (assoc :asks
-             (reduce update-book-entry
-                     (:asks book)
-                     (:asks update)))))
-
-#_
-(update->book
-  (snapshot->book
-    (empty-book (ticker :eth/btc))
-    '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
-      :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])})
-  '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
-    :bids ([5M 0M] [2.51M 1M])})
-
-(def ^:private BOOKS
-  ;; ticker => Book
-  (atom {}))
-;; Where each map entry is:
-;;
-;; {ticker (Book. ticker agent ch)}
-;;
-;; where agent is e.g.
-;;
-;; {:ticker ticker
-;;  :asks   {6.96M 7M                      ;best ask
-;;           7.59M 23M}
-;;  :bids   {4M    0.9M                    ;best bid
-;;           2.51M 1M}}
-
-(defmulti book-sub-handle-msg (fn [[tag _] _] tag))
-
-(defmethod book-sub-handle-msg :snapshot
-  [[_ payload] book]
-  (send (:agent book)
-        snapshot->book
-        (:snapshot payload))
-  [:recur])
-
-(defmethod book-sub-handle-msg :update
-  [[_ payload] book]
-  (send (:agent book)
-        update->book
-        (:update payload))
-  [:recur])
-
-(defmethod book-sub-handle-msg :subscribed [_ _]
-  [:recur])
-
-(defmethod book-sub-handle-msg :unsubscribed [_ {ticker :ticker
-                                                 :as book}]
-  (doseq [topic [[:subscribed ticker]
-                 [:unsubscribed ticker]
-                 [:snapshot ticker]
-                 [:update ticker]]]
-    (a/unsub (:pub (connection))
-             topic
-             (:ch book)))
-  [:stop])
-
-(defmethod book-sub-handle-msg :proc
-  [[_ payload] {ticker :ticker
-                :as book}]
-  (case (:command payload)
-    (:stop) (do
-              (log/info
-                "Book " book " subscribtion received :stop command.")
-              ;; unsub so we don't accidentally block the pub
-              (doseq [topic [[:subscribed ticker]
-                             [:unsubscribed ticker]
-                             [:snapshot ticker]
-                             [:update ticker]]]
-                (a/unsub (:pub (connection))
-                         topic
-                         (:ch book)))
-              ;; inform exchange, but we won't handle the unsubscribed confo
-              (send-msg [:unsubscribe ticker])
-              ;; stop proc
-              (conj-some [:stop] (:when payload)))
-
-    ;; else
-    (do
-      (log/error "Unrecognized command in proc " (:command payload))
-      [:recur])))
-
-(defn subscribe-book
-  [{ticker :ticker
-    :as book}]
-
-  (or
-    ;; already subscribed
-    (get @BOOKS ticker)
-
-    ;; subscribe new book
-    (do
-      ;; start proc
-      (a/go
-        (loop [msg (a/<! (:ch book))
-               stop-when (constantly false)]
-          (log/info "Book received " msg)
-
-          (let [[ret arg] (book-sub-handle-msg msg book)]
-            (log/debug "ret and arg" [ret arg])
-            (cond
-              (nil? msg)
-              (do
-                (log/info
-                  "Process updating " ticker " book stopped."
-                  "Book pub was closed.")
-                (swap! @BOOKS dissoc ticker)
-                [:process "stopped"])
-
-              (stop-when msg)
-              (do
-                (log/info "Process updating " ticker " book stopped."
-                          "Last msg " msg " received.")
-                (swap! @BOOKS dissoc ticker)
-                [:process "stopped"])
-
-              :handle-ret-and-continue
-              (case ret
-                :recur (recur
-                         (a/<! (:ch book))
-                         stop-when)
-                :stop (if-some [stop-when arg]
-                        ;; stop the next (stop-when msg) => true
-                        (let [stop-when arg]
-                          (recur
-                            (a/<! (:ch book))
-                            stop-when))
-                        ;; stop immediately
-                        (do
-                          (log/info "Process updating " ticker " book stopped.")
-                          (swap! @BOOKS dissoc ticker)
-                          [:process "stopped"])))))))
-
-      ;; sub to topics
-      (doseq [topic [[:subscribed ticker]
-                     [:unsubscribed ticker]
-                     [:snapshot ticker]
-                     [:update ticker]]]
-
-        (a/sub (:pub (connection))
-               topic
-               (:ch book)))
-
-      (swap! BOOKS assoc ticker book)
-
-      ;; send subscribtion msg to exch
-      (send-msg [:subscribe ticker])
-
-      book)))
-
-(defn -main []
-  (let [conn (connect)
-        ticker (ticker :usd/btc)
-
-        book (subscribe-book
-               (map->Book
-                 {:ticker ticker
-                  :agent (agent (empty-book ticker))
-                  :ch (a/chan 100)}))]
-    (add-watch
-      (:agent book)
-      :book-watcher (fn [_ _ _ new-state]
-                      (println "Book updated:")
-                      (pprint new-state)))
-
-    (a/put!
-      (:in (connection))
-      [:subscribed {:ticker ticker}])
-
-    ;; snapshot
-    (a/put!
-      (:in (connection))
-      [:snapshot
-       {:ticker ticker
-        :snapshot
-        '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
-          :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])}}])
-
-    ;; update
-    (a/put!
-      (:in (connection))
-      [:update
-       {:ticker ticker
-        :update
-        '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
-          :bids ([5M 0M] [2.51M 1M])}}])
-
-    (read-line)))
-
-(comment
-
-  (connect)
-  (send-msg [:subscribe (ticker :btc/eth)])
-  (send-msg [:unsubscribe (ticker :btc/eth)])
-
-  (a/put! (:ch b) [:proc {:command :stop}])
-  (a/put! (:ch b) [:proc {:command :stop
-                          :when (fn [[tag]] (= tag :unsubscribed))}])
-  (reset! BOOKS (atom {}))
-
-  (subscribe-book
-    (map->Book
-      {:ticker (ticker :usd/btc)
-       :agent (agent (empty-book (ticker :usd/btc)))
-       :ch (a/chan)}))
-
-
-  (def b (get @BOOKS (ticker :usd/btc)))
-
-  (defn topicfn [[tag {ticker :ticker}]]
-    (conj-some [tag] ticker))
-
-  (a/put!
-    (:in (connection))
-    [:subscribed {:ticker (ticker :usd/btc)}])
-
-  ;; snapshot
-  (a/put!
-    (:in (connection))
-    [:snapshot
-     {:ticker (ticker :usd/btc)
-      :snapshot
-      '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
-        :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])}}])
-
-  ;; update
-  (a/put!
-    (:in (connection))
-    [:update
-     {:ticker (ticker :usd/btc)
-      :update
-      '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
-        :bids ([5M 0M] [2.51M 1M])}}])
-
-  (update->book
-    (snapshot->book
-      (empty-book (ticker :eth/btc))
-      '{:asks ([7.59M 23.39216286M] [6.96M 7.23746288M] [5.5M 12.3M])
-        :bids ([5M 65.64632441M] [2.51M 0.93194317M] [4M 0.93194317M])})
-    '{:asks ([7.59M 23M] [6.96M 7M] [5.5M 0M])
-      :bids ([5M 0M] [2.51M 1M])}))
-
-
-;;* Requests
 
 ;; Conf
 ;; {
 ;;   event: "conf",
 ;;   flags: FLAGS
 ;;  }
-
-;; Subscribe
-
-;; // request
-;; {
-;;   "event": "subscribe",
-;;   "channel": "book",
-;;   "symbol": "tBTCUSD",
-;;   "prec": "P0",
-;;   "freq": "F0",
-;;   "len": 25
-;;  }
-
-;; Unsubscribe
-
-;; // request
-;; {
-;;   "event": "unsubscribe",
-;;   "chanId": 6
-;; }

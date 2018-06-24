@@ -177,6 +177,7 @@
   BookProtocol
   (-book-sub [book] (send-out conn [:subscribe ticker]))
   (-book-unsub [book] (send-out conn [:unsubscribe ticker]))
+  ;; TODO status never gets toggled anywhere
   (-book-subscribed? [book] status)
   (-book-apply-snapshot [book snapshot] (send agent snapshot->book snapshot) book)
   (-book-apply-update [book update] (send agent update->book update) book)
