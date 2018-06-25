@@ -273,7 +273,6 @@
 (defn create-exch [conn]
   (letfn [(topic-fn [[tag payload]]
             (let [topic (conj-some [tag] (:ticker payload))]
-              (println "Topic " topic)
               topic))]
     (Exch. conn
            (atom
@@ -295,6 +294,16 @@
                            (conj-some [tag] ticker)))
                        tag))
 
+(defmethod handle-msg :pong [exch [_ {cid :cid ts :ts}]]
+  (log/info "Received "
+            (with-out-str
+              (pprint
+                (conj-some
+                  [:pong]
+                  (-> nil
+                      (assoc-some :ts ts)
+                      (assoc-some :cid cid)))))))
+
 (defmethod handle-msg :subscribed [exch [_ {ticker :ticker}]]
   (add-book exch ticker))
 
@@ -314,10 +323,13 @@
 
 (defn start-standard-msg-handlers [exch ticker]
   (let [chan (a/chan 1)]
+    ;; TODO too easy to forget to subscribe a new type of msg. There must be a 1
+    ;; to 1 between handle-msg methods and standard subs.
     (sub exch [:subscribed ticker] chan)
     (sub exch [:snapshot ticker] chan)
     (sub exch [:update ticker] chan)
     (sub exch [:unsubscribed ticker] chan)
+    (sub exch [:pong] chan)
     (a/go-loop []
       (when-let [msg (a/<! chan)]
         (handle-msg exch msg)
