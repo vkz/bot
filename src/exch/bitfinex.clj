@@ -24,6 +24,9 @@
 
 (def ^:private NSNAME (str (ns-name *ns*)))
 
+(defn- ns-keywordize [str]
+  (keyword NSNAME str))
+
 (def ^:private URL "wss://api.bitfinex.com/ws/2")
 
 (def ^:private pairs
@@ -129,6 +132,7 @@
 (declare send-msg receive-msg)
 
 (defprotocol StateProtocol
+  (set-stream [state stream])
   (chan-of-ticker [state ticker])
   (ticker-of-chan [state chan])
   (add-chan [state chan ticker])
@@ -137,6 +141,7 @@
 
 (defrecord State [stream channels tickers status]
   StateProtocol
+  (set-stream [state new-stream] (State. new-stream channels tickers status))
   (chan-of-ticker [state ticker] (get tickers ticker))
   (ticker-of-chan [state chan] (get channels chan))
   (add-chan [state chan ticker]
@@ -160,6 +165,7 @@
 
 (defrecord Connection [in out state]
   StateProtocol
+  (set-stream [conn stream] (swap! state set-stream stream) conn)
   (chan-of-ticker [conn ticker] (chan-of-ticker @state ticker))
   (ticker-of-chan [conn chan] (ticker-of-chan @state chan))
   (add-chan [conn chan ticker] (swap! state add-chan chan ticker) conn)
@@ -182,24 +188,32 @@
           ;; source of user msgs to send to exchange
           (s/->source out)
 
+          ;; NOTE connect-via requires an explicit s/put! in the via-fn!
+
           _
           ;; exchange <= out <= user
-          (s/connect-via out-stream json/encode exch-stream)
+          (s/connect-via out-stream
+                         (fn [msg]
+                           (->> msg
+                                (json/encode)
+                                (s/put! exch-stream)))
+                         exch-stream)
 
           _
           ;; exchange => in => user
           (s/connect-via exch-stream
                          (fn [msg]
-                           (receive-msg
-                             conn
-                             (json/decode
-                               #(keyword NSNAME %))))
+                           (-> msg
+                               (json/decode ns-keywordize)
+                               (->>
+                                 (receive-msg conn)
+                                 (s/put! in-stream))))
                          in-stream)]
-      (Connection.
-        in
-        out
-        (atom
-          (State. exch-stream {} {} true)))))
+      ;; TODO Maybe have a proc sending out [:ping] to keep alive
+      (-> conn
+          (set-stream exch-stream)
+          (toggle-status))))
+
   (disconnect [conn]
     (a/close! in)
     (toggle-status conn))
@@ -231,7 +245,7 @@
       (json/decode
         ;; TODO whould *ns* work as expected when this fn is requried elsewhere?
         ;; E.g. gdax namespace etc.
-        #(keyword NSNAME %))))
+        ns-keywordize)))
 
 ;;** - update
 (spec/def ::update
@@ -322,7 +336,7 @@
 
 ;;** - dispatch by tag
 
-(defmulti convert-msg (fn [conn [tag]] (println "tag " tag) tag))
+(defmulti convert-msg (fn [conn [tag]] tag))
 
 (defn add-ticker-or-drop
   [conn [tag {channel :channel
@@ -491,6 +505,12 @@
 ;; implement. Then implementations would dispatch on the message tag and would
 ;; know if it needs to send it to a specific REST endpoint.
 (defmulti send-msg (fn [conn [tag _]] tag))
+
+(defmethod send-msg :ping
+  [conn [_]]
+  (a/put!
+    (:out conn)
+    {:event "ping"}))
 
 (defmethod send-msg :subscribe
   [conn [_ ticker]]
