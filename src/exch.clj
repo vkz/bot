@@ -296,7 +296,6 @@ If state already has a book for that ticker, do nothing. Return Exch.")
   (get-name [Exch]
     "Return Exch's name. E.g. :bitfinex."))
 
-;; TODO Extend ConnectionProtocol and BookProtocol to Exch?
 (defrecord Exch [conn state]
   ExchProtocol
   (sub [exch topic chan]

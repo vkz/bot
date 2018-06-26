@@ -26,25 +26,28 @@
   (log/info "Connecting to exchange")
   (connect c)
 
-  (send-out c [:ping])
+  (send-to-exch e [:ping])
 
-  (send-out c [:subscribe tick])
+  (def book (get-book e tick))
+  (log/info "Book subscribed? " (book-subscribed? book))
+  (book-sub book)
 
   (def result
     (async/thread
       (let [result
             (vector
               (do (Thread/sleep 3000)
-                  (book-snapshot
-                    (get-book e tick)))
+                  (book-snapshot book))
               (do (Thread/sleep 2000)
-                  (book-snapshot
-                    (get-book e tick))))]
-        (send-out c [:unsubscribe tick])
+                  (book-snapshot book)))]
+        (log/info "Book subscribed? " (book-subscribed? book))
+        (book-unsub book)
         (Thread/sleep 2000)
         result)))
 
   (pprint
     (async/<!! result))
+
+  (log/info "Book subscribed? " (book-subscribed? book))
 
   (System/exit 0))
