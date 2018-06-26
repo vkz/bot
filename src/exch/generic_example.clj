@@ -31,11 +31,11 @@
 
   (send-in c [:subscribed {:ticker tick}])
 
-  (watch (get-book e tick)
-         :logger
-         (fn [_ new-state]
-           (println "Book updated:")
-           (pprint new-state)))
+  (book-watch (get-book e tick)
+              :logger
+              (fn [_ new-state]
+                (println "Book updated:")
+                (pprint new-state)))
 
   ;; snapshot
   (send-in c

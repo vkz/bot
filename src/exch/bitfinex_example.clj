@@ -35,10 +35,10 @@
       (let [result
             (vector
               (do (Thread/sleep 3000)
-                  (snapshot
+                  (book-snapshot
                     (get-book e tick)))
               (do (Thread/sleep 2000)
-                  (snapshot
+                  (book-snapshot
                     (get-book e tick))))]
         (send-out c [:unsubscribe tick])
         (Thread/sleep 2000)

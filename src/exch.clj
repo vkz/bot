@@ -122,29 +122,46 @@
 
 ;;* Connection
 (defprotocol ConnectionProtocol
-  (connect [Conn])
-  (disconnect [Conn])
-  (connected? [Conn])
-  (send-out [Conn msg])
-  ;; for testing: puts msg on the internal :in port
-  (send-in [Conn msg])
+  "Public methods that every exchange connection record must implement.
+  Conn is a record, type or class that represents exchange connection.
+  Every exchange is expected to define a Connection type that implements these
+  methods."
+  (connect [Conn]
+    "Establish connection with an exchange performing any idiosyncratic setup.")
+  (disconnect [Conn]
+    "Break connection with an exchange performing any idiosyncratic setup.")
+  (connected? [Conn]
+    "Are we connected to the exchange?")
+  (send-out [Conn msg]
+    "Send :exch/msg to the exchange. We expect the msg to be converted to exchange
+    specific format somewhere after send-out. Typically send-out would simply put
+    an :exch/msg onto the (:out Connection) channel.")
+  (send-in [Conn msg]
+    "Send :exch/msg \"from\" the exchange. Typically it simply puts :exch/msg onto
+    the (:in Connection) channel as if it was send by the exchange and converted
+    to :exch/msg format. This method is intended for testing.")
+
   ;; json => exch/msg
-  (convert-incomming-msg [Conn msg])
+  (convert-incomming-msg [Conn msg]
+    "Convert JSON str sent by the exchange to :exch/msg format. Return :exch/msg.")
   ;; exch/msg => json
-  (convert-outgoing-msg [Conn msg])
-  (conn-name [Conn]))
+  (convert-outgoing-msg [Conn msg]
+    "Convert :exch/msg to the msg format of the exchange. Return JSON string.")
+  (conn-name [Conn]
+    "Return connection name e.g. :bitfinex."))
 
 ;;* Book
 (defn empty-book [ticker]
   {:ticker ticker
+   :status false
    :asks (sorted-map-by <)
    :bids (sorted-map-by >)})
 
 (defn snapshot->book
   [book snapshot]
-  {:ticker (:ticker book)
-   :asks (into (sorted-map-by <) (:asks snapshot))
-   :bids (into (sorted-map-by >) (:bids snapshot))})
+  (-> book
+      (assoc :asks (into (sorted-map-by <) (:asks snapshot)))
+      (assoc :bids (into (sorted-map-by >) (:bids snapshot)))))
 
 (defn- update-book-entry [side [price size]]
   (if (zero? size)
@@ -165,60 +182,81 @@
                      (:asks update)))))
 
 (defprotocol BookProtocol
-  (-book-sub [Book])
-  (-book-unsub [Book])
-  (-book-subscribed? [Book])
-  (-book-apply-snapshot [Book snapshot])
-  (-book-apply-update [Book update])
-  (snapshot [Book])
-  (bids [Book])
-  (asks [Book])
-  ;; callback: fn [old-val new-val]
-  (watch [Book key callback])
-  (unwatch [Book key]))
+  (-book-apply-snapshot [Book snapshot]
+    "Update bids/asks from :exch/snapshot msg. Return Book.")
+  (-book-apply-update [Book update]
+    "Update bids/asks from :exch/update msg. Return Book.")
+  (book-subscribed? [Book]
+    "Is book subscribed to exchange L2 updates?")
+  (book-toggle-status [Book] [Book status]
+    "Toggle book subscribtion status (true | false) or set it to status.")
+  (book-sub [Book]
+    "Subscribed book to exchange L2 updates. Return Book.")
+  (book-unsub [Book]
+    "Unsubscribe book from exchange L2 updates. Return Book.")
+  (book-snapshot [Book]
+    "Return book snapshot where :bids and :asks are sorted best price to worse:
 
-(defrecord Book [ticker conn agent status]
+{:bids {highest_bid amount
+        ...         ...}
+ :asks {lowest_ask amount
+        ...        ...}}")
+  (book-watch [Book key callback]
+    "Register a callback (fn [old_snapshot new_snapshot]) to be called every time
+    the book receives an update. Return Book.")
+  (book-unwatch [Book key]
+    "Unregister a callback corresponding to the key from being called on book
+    updates. Return Book."))
+
+(defrecord Book [ticker conn agent]
   BookProtocol
-  ;; TODO I never actually use these
-  (-book-sub [book] (send-out conn [:subscribe ticker]))
-  (-book-unsub [book] (send-out conn [:unsubscribe ticker]))
-  ;; TODO status never gets toggled anywhere
-  (-book-subscribed? [book] status)
   (-book-apply-snapshot [book snapshot] (send agent snapshot->book snapshot) book)
   (-book-apply-update [book update] (send agent update->book update) book)
-  (snapshot [book] @agent)
-  (bids [book] (get @agent :bids))
-  (asks [book] (get @agent :asks))
-  (watch [book key callback]
+  (book-subscribed? [book] (get @agent :status))
+  (book-toggle-status [book] (send agent update :status not))
+  (book-toggle-status [book status] (send agent assoc :status status))
+  (book-sub [book] (when-not (book-subscribed? book) (send-out conn [:subscribe ticker])) book)
+  (book-unsub [book] (when (book-subscribed? book) (send-out conn [:unsubscribe ticker])) book)
+  (book-snapshot [book] @agent)
+  (book-watch [book key callback]
     (add-watch
       agent
       key
       (fn [_ _ old-book new-book]
-        (callback old-book new-book))))
-  (unwatch [book key]
-    (remove-watch agent key)))
+        (callback old-book new-book)))
+    book)
+  (book-unwatch [book key]
+    (remove-watch agent key)
+    book))
 
 (defn create-book [conn ticker]
   (Book. ticker
          conn
-         (agent (empty-book ticker))
-         false))
+         (agent (empty-book ticker))))
 
 ;;* State
 
 (defprotocol StateProtocol
-  (-state-sub [this topic chan])
-  (-state-unsub [this topic chan])
-  (-state-book [this ticker])
-  (-state-add-book [this book])
-  (-state-rm-book [this book]))
+  "Private methods to manage the value of Exch state Atom - the State record. These
+  methods work on the state value itself, not the ref.
 
-;; books:
-;; {ticker => Book}
-;; pub:
-;; (async/pub (conn :in) topic-fn)
-;; subs:
-;; {topic => #{chan}}
+  ExchProtocol works with the state Atom by calling StateProtocol methods to swap
+  the Atom's current value."
+  (-state-sub [this topic chan]
+    "Add chan to topic subscribers. Subscribers as a map of topic => #{chan}.")
+  (-state-unsub [this topic chan]
+    "Remove chan from topic subscribers. Subscribers as a map of topic =>
+    #{chan}.")
+  (-state-get-book [this ticker]
+    "Return the Book for ticker or nil if not in the State.")
+  (-state-add-book [this book]
+    "Add book to the State.")
+  (-state-rm-book [this book]
+    "Remove book from the State."))
+
+;; books: {ticker => Book}
+;; pub:   (async/pub (conn :in) topic-fn)
+;; subs:  {topic => #{chan}}
 (defrecord State [books pub subs]
   StateProtocol
   (-state-sub [state topic chan]
@@ -237,43 +275,62 @@
                         (disj
                           (get subs topic)
                           chan))))
-  (-state-book [this ticker] (get books ticker))
+  (-state-get-book [this ticker] (get books ticker))
   (-state-add-book [this book] (State. (assoc books (:ticker book) book) pub subs))
   (-state-rm-book [this book] (State. (dissoc books (:ticker book)) pub subs)))
 
 ;;* Exch
 
 (defprotocol ExchProtocol
-  (sub [Exch topic chan])
-  (unsub [Exch topic chan])
-  (add-book [Exch ticker])
-  (rm-book [Exch ticker])
-  (get-book [Exch ticker])
-  (exch-name [Exch]))
+  (sub [Exch topic chan]
+    "Duplicate incomming topic msgs to chan. Return Exch.")
+  (unsub [Exch topic chan]
+    "Stop duplicating incomming topic msgs to chan. Return Exch.")
+  (add-book [Exch ticker]
+    "Create and add a Book for ticker (e.g. (ticker :usd/btc)) to exch state.
+If state already has a book for that ticker, do nothing. Return Exch.")
+  (rm-book [Exch ticker]
+    "Remove a Book for ticker from the Exch state. Return Exch.")
+  (get-book [Exch ticker]
+    "Return a Book associated with ticker. Create and add it to State if it doesn't exist.")
+  (get-name [Exch]
+    "Return Exch's name. E.g. :bitfinex."))
 
-(defrecord Exch [connection state]
+;; TODO Extend ConnectionProtocol and BookProtocol to Exch?
+(defrecord Exch [conn state]
   ExchProtocol
   (sub [exch topic chan]
     (a/sub (:pub @state) topic chan)
-    (swap! state -state-sub topic chan))
+    (swap! state -state-sub topic chan)
+    exch)
   (unsub [exch topic chan]
     (swap! state -state-unsub topic chan)
-    (a/unsub (:pub @state) topic chan))
-  (add-book [exch ticker]
-    (when-not (-state-book @state ticker)
-      (swap! state -state-add-book (create-book connection ticker)))
+    (a/unsub (:pub @state) topic chan)
     exch)
-  (rm-book [exch ticker] (swap! state -state-rm-book (get-book exch ticker)) exch)
-  (get-book [exch ticker] (or (-state-book @state ticker)
-                              (do (add-book exch ticker)
-                                  (get-book exch ticker))))
-  (exch-name [exch] (conn-name connection)))
+  (add-book [exch ticker]
+    (when-not (-state-get-book @state ticker)
+      (swap! state -state-add-book (create-book conn ticker)))
+    exch)
+  (rm-book [exch ticker]
+    ;; TODO if book doesn't exist get-book will create one to be immediately
+    ;; removed. I wonder if this is ok? Is there a chance of race with another
+    ;; thread that does get-book concurrently?
+    (let [book (get-book exch ticker)]
+      (book-unsub book)
+      (swap! state -state-rm-book book))
+    exch)
+  ;; TODO Is it really worth creating a book if it doesn't exist?
+  (get-book [exch ticker]
+    (or (-state-get-book @state ticker)
+        (do (add-book exch ticker)
+            (get-book exch ticker))))
+  (get-name [exch] (conn-name conn)))
 
 (defn send-to-exch [exch msg]
-  (send-out (:connection exch) msg))
+  (send-out (:conn exch) msg))
 
 (defn send-from-exch [exch msg]
-  (send-in (:connection exch) msg))
+  (send-in (:conn exch) msg))
 
 (defn create-exch [conn]
   (letfn [(topic-fn [[tag payload]]
@@ -294,8 +351,8 @@
 (defmulti handle-msg (fn [exch [tag {ticker :ticker}]]
                        (log/info
                          (format
-                           "[Exchange %s] handling msg: %s"
-                           (exch-name exch)
+                           "[%s] handling msg: %s"
+                           (get-name exch)
                            (conj-some [tag] ticker)))
                        tag))
 
@@ -310,7 +367,10 @@
                       (assoc-some :cid cid)))))))
 
 (defmethod handle-msg :subscribed [exch [_ {ticker :ticker}]]
-  (add-book exch ticker))
+  (-> exch
+      (add-book ticker)
+      (get-book ticker)
+      (book-toggle-status true)))
 
 (defmethod handle-msg :snapshot [exch [_ {ticker :ticker
                                           snapshot :snapshot}]]
@@ -321,7 +381,9 @@
   (-book-apply-update (get-book exch ticker) update))
 
 (defmethod handle-msg :unsubscribed [exch [_ {ticker :ticker}]]
-  (rm-book exch ticker))
+  (-> exch
+      (get-book ticker)
+      (book-toggle-status false)))
 
 (defmethod handle-msg :default [exch msg]
   (log/error "No standard handler for msg " msg))
@@ -479,3 +541,5 @@
 (gen/sample
   (spec/gen ::message))
 
+#_
+(spec/exercise ::message)
