@@ -54,7 +54,6 @@
 
 (defrecord Product [symbol])
 (defrecord Pair [symbol])
-;; TODO Install reader printer to print e.g. #:eth/btc or something like that
 
 (def ^:private PAIRS
   (->> pairs
@@ -129,7 +128,9 @@
 
 ;;* State
 
-(declare send-msg receive-msg)
+(declare
+  convert-incomming-msg
+  convert-outgoing-msg)
 
 (defprotocol StateProtocol
   (set-stream [state stream])
@@ -195,7 +196,11 @@
           (s/connect-via out-stream
                          (fn [msg]
                            (->> msg
+                                ;; exch/msg
+                                (convert-outgoing-msg conn)
+                                ;; json/msg
                                 (json/encode)
+                                ;; json
                                 (s/put! exch-stream)))
                          exch-stream)
 
@@ -204,9 +209,13 @@
           (s/connect-via exch-stream
                          (fn [msg]
                            (-> msg
+                               ;; json
                                (json/decode ns-keywordize)
+                               ;; json/msg
                                (->>
-                                 (receive-msg conn)
+                                 ;; with bitfinex-namespaced keys
+                                 (convert-incomming-msg conn)
+                                 ;; exch/msg
                                  (s/put! in-stream))))
                          in-stream)]
       ;; TODO Maybe have a proc sending out [:ping] to keep alive
@@ -214,17 +223,10 @@
           (set-stream exch-stream)
           (toggle-status))))
 
-  (disconnect [conn]
-    (a/close! in)
-    (toggle-status conn))
+  (disconnect [conn] (a/close! in) (toggle-status conn))
   (connected? [conn] (:status @state))
-  (send-out [conn msg]
-    (send-msg conn msg))
-  ;; for testing: puts msg on the internal :in port
-  (send-in [conn msg]
-    (a/put!
-      (:in conn)
-      (receive-msg conn msg)))
+  (send-out [conn msg] (a/put! (:out conn) msg))
+  (send-in [conn msg] (a/put! (:in conn) msg))
   (conn-name [conn] (keyword NSNAME)))
 
 (defn create-connection []
@@ -234,18 +236,10 @@
 
 ;;* Message specs
 
-;; NOTE Caution with spec/def registry names. If it ever matches a key in a map
-;; that you conform against spec will be checked recursively which may lead to
-;; bizarre behaviour and errors. Suppose the idea is to treat spec/defs as
-;; keywords with validation wherever said keywords may turn up.
-
 (defn map-json-map [msg]
   (-> msg
       (json/encode)
-      (json/decode
-        ;; TODO whould *ns* work as expected when this fn is requried elsewhere?
-        ;; E.g. gdax namespace etc.
-        ns-keywordize)))
+      (json/decode ns-keywordize)))
 
 ;;** - update
 (spec/def ::update
@@ -309,13 +303,13 @@
     :snapshot ::snapshot-msg
     :update ::update-msg))
 
-;;* Message receive
+;;* Message incomming
+
 (declare
-  convert-msg
-  convert-event-msg)
+  -convert-incomming-msg
+  -convert-incomming-event-msg)
 
-
-(defn receive-msg [conn message]
+(defn convert-incomming-msg [conn message]
   (let [msg
         (spec/conform
           ::message
@@ -332,11 +326,11 @@
               ::message
               message))))
 
-      (convert-msg conn msg))))
+      (-convert-incomming-msg conn msg))))
 
 ;;** - dispatch by tag
 
-(defmulti convert-msg (fn [conn [tag]] tag))
+(defmulti -convert-incomming-msg (fn [conn [tag]] tag))
 
 (defn add-ticker-or-drop
   [conn [tag {channel :channel
@@ -351,7 +345,7 @@
                  (assoc :tag tag)
                  (assoc :reason reason))])))
 
-(defmethod convert-msg :heartbeat
+(defmethod -convert-incomming-msg :heartbeat
   [conn msg]
   (add-ticker-or-drop conn msg))
 
@@ -395,7 +389,7 @@
            [584.96M 7.23746288M]
            [584.97M 12.3M])})
 
-(defmethod convert-msg :snapshot
+(defmethod -convert-incomming-msg :snapshot
   [conn [tag payload]]
   (add-ticker-or-drop
     conn
@@ -403,7 +397,7 @@
            payload
            :snapshot snapshot->bids-asks)]))
 
-(defmethod convert-msg :update
+(defmethod -convert-incomming-msg :update
   [conn [_ {update :update
             :as m}]]
   (add-ticker-or-drop
@@ -412,20 +406,20 @@
      (assoc m :update
             (update->bids-asks [update]))]))
 
-(defmethod convert-msg :event [conn [_ m]]
-  (convert-event-msg conn m))
+(defmethod -convert-incomming-msg :event [conn [_ m]]
+  (-convert-incomming-event-msg conn m))
 
 ;;** - dispatch by event type
-(defmulti convert-event-msg (fn [conn msg] (::event msg)))
+(defmulti -convert-incomming-event-msg (fn [conn msg] (::event msg)))
 
-(defmethod convert-event-msg "pong"
+(defmethod -convert-incomming-event-msg "pong"
   [conn {ts ::ts cid ::cid :as m}]
   [:pong
    (-> m
        (assoc :timestamp (timestamp ts))
        (assoc :id cid))])
 
-(defmethod convert-event-msg "info"
+(defmethod -convert-incomming-event-msg "info"
   [conn {event ::event code ::code msg ::msg :as m}]
   (let [tag
         (case code
@@ -454,7 +448,7 @@
 
     [tag payload]))
 
-(defmethod convert-event-msg "subscribed"
+(defmethod -convert-incomming-event-msg "subscribed"
   [conn {pair ::pair channel ::chanId :as m}]
   (let [ticker
         (ticker
@@ -465,7 +459,7 @@
     [:subscribed
      (assoc m :ticker ticker)]))
 
-(defmethod convert-event-msg "unsubscribed"
+(defmethod -convert-incomming-event-msg "unsubscribed"
   [conn {channel ::chanId :as m}]
   (if-let [ticker (ticker-of-chan conn channel)]
 
@@ -483,7 +477,7 @@
              (assoc :tag :unsubscribed)
              (assoc :reason reason))]))))
 
-(defmethod convert-event-msg "error"
+(defmethod -convert-incomming-event-msg "error"
   [conn {code ::code msg ::msg :as m}]
   (let [tag
         :error
@@ -501,40 +495,29 @@
 
 ;;* Message send
 
-;; TODO prob want a ISender protocol defined in exch that each connection can
-;; implement. Then implementations would dispatch on the message tag and would
-;; know if it needs to send it to a specific REST endpoint.
-(defmulti send-msg (fn [conn [tag _]] tag))
+(defmulti convert-outgoing-msg (fn [conn [tag _]] tag))
 
-(defmethod send-msg :ping
+(defmethod convert-outgoing-msg :ping
   [conn [_]]
-  (a/put!
-    (:out conn)
-    {:event "ping"}))
+  {:event "ping"})
 
-(defmethod send-msg :subscribe
+(defmethod convert-outgoing-msg :subscribe
   [conn [_ ticker]]
-  (a/put!
-    (:out conn)
-    {:event "subscribe"
-     :channel "book"
-     :symbol (:symbol (product ticker))
-     :prec "P0"
-     :freq "F0"}))
+  {:event "subscribe"
+   :channel "book"
+   :symbol (:symbol (product ticker))
+   :prec "P0"
+   :freq "F0"})
 
-(defmethod send-msg :unsubscribe
+(defmethod convert-outgoing-msg :unsubscribe
   [conn [_ ticker]]
   (let [channel (chan-of-ticker conn ticker)]
-    (a/put!
-      (:out conn)
-      {:event "unsubscribe"
-       :chanId channel})))
+    {:event "unsubscribe"
+     :chanId channel}))
 
-(defmethod send-msg :default
+(defmethod convert-outgoing-msg :default
   [conn msg]
-  (a/put!
-    (:out conn)
-    msg))
+  msg)
 
 ;; Conf
 ;; {

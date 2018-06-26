@@ -175,6 +175,7 @@
 
 (defrecord Book [ticker conn agent status]
   BookProtocol
+  ;; TODO I never actually use these
   (-book-sub [book] (send-out conn [:subscribe ticker]))
   (-book-unsub [book] (send-out conn [:unsubscribe ticker]))
   ;; TODO status never gets toggled anywhere
