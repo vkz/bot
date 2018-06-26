@@ -128,6 +128,10 @@
   (send-out [Conn msg])
   ;; for testing: puts msg on the internal :in port
   (send-in [Conn msg])
+  ;; json => exch/msg
+  (convert-incomming-msg [Conn msg])
+  ;; exch/msg => json
+  (convert-outgoing-msg [Conn msg])
   (conn-name [Conn]))
 
 ;;* Book

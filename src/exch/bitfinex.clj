@@ -17,7 +17,9 @@
 (require '[exch :as exch
            :refer
            [ticker ticker-kw base commodity currency
-            timestamp decimal conj-some]]
+            timestamp decimal conj-some
+            convert-incomming-msg
+            convert-outgoing-msg]]
          :reload)
 
 ;;* Utils & constants
@@ -128,10 +130,6 @@
 
 ;;* State
 
-(declare
-  convert-incomming-msg
-  convert-outgoing-msg)
-
 (defprotocol StateProtocol
   (set-stream [state stream])
   (chan-of-ticker [state ticker])
@@ -164,6 +162,11 @@
 
 ;;* Connection
 
+(declare
+  -convert-incomming-msg
+  -convert-incomming-event-msg
+  -convert-outgoing-msg)
+
 (defrecord Connection [in out state]
   StateProtocol
   (set-stream [conn stream] (swap! state set-stream stream) conn)
@@ -174,6 +177,25 @@
   (toggle-status [conn] (swap! state toggle-status) conn)
 
   exch/ConnectionProtocol
+  (convert-outgoing-msg [conn msg] (-convert-outgoing-msg conn msg))
+  (convert-incomming-msg [conn msg]
+    (let [exch-msg
+          (spec/conform
+            ::message
+            (json/decode msg ns-keywordize))]
+
+      (if (spec/invalid? exch-msg)
+
+        (do
+          ;; log error unrecognized message and drop it - don't break the system
+          (log/error
+            "Received message did not conform to spec\n"
+            (with-out-str
+              (spec/explain-data
+                ::message
+                msg))))
+
+        (-convert-incomming-msg conn exch-msg))))
   (connect [conn]
     (let [exch-stream
           @(http/websocket-client
@@ -198,8 +220,6 @@
                            (->> msg
                                 ;; exch/msg
                                 (convert-outgoing-msg conn)
-                                ;; json/msg
-                                (json/encode)
                                 ;; json
                                 (s/put! exch-stream)))
                          exch-stream)
@@ -208,15 +228,11 @@
           ;; exchange => in => user
           (s/connect-via exch-stream
                          (fn [msg]
-                           (-> msg
-                               ;; json
-                               (json/decode ns-keywordize)
-                               ;; json/msg
-                               (->>
-                                 ;; with bitfinex-namespaced keys
-                                 (convert-incomming-msg conn)
-                                 ;; exch/msg
-                                 (s/put! in-stream))))
+                           (->> msg
+                                ;; json
+                                (convert-incomming-msg conn)
+                                ;; exch/msg
+                                (s/put! in-stream)))
                          in-stream)]
       ;; TODO Maybe have a proc sending out [:ping] to keep alive
       (-> conn
@@ -295,7 +311,7 @@
 (spec/def ::event-msg
   (spec/multi-spec event-type ::event))
 
-;;** - any
+;;** - message
 (spec/def ::message
   (spec/or
     :event ::event-msg
@@ -303,30 +319,7 @@
     :snapshot ::snapshot-msg
     :update ::update-msg))
 
-;;* Message incomming
-
-(declare
-  -convert-incomming-msg
-  -convert-incomming-event-msg)
-
-(defn convert-incomming-msg [conn message]
-  (let [msg
-        (spec/conform
-          ::message
-          message)]
-
-    (if (spec/invalid? msg)
-
-      (do
-        ;; log error unrecognized message and drop it - don't break the system
-        (log/error
-          "Received message did not conform to spec\n"
-          (with-out-str
-            (spec/explain-data
-              ::message
-              message))))
-
-      (-convert-incomming-msg conn msg))))
+;;* Convert incomming msg
 
 ;;** - dispatch by tag
 
@@ -493,31 +486,33 @@
 
     [tag payload]))
 
-;;* Message send
+;;* Convert outgoing msg
 
-(defmulti convert-outgoing-msg (fn [conn [tag _]] tag))
+(defmulti -convert-outgoing-msg (fn [conn [tag _]] tag))
 
-(defmethod convert-outgoing-msg :ping
+(defmethod -convert-outgoing-msg :ping
   [conn [_]]
-  {:event "ping"})
+  (json/encode {:event "ping"}))
 
-(defmethod convert-outgoing-msg :subscribe
+(defmethod -convert-outgoing-msg :subscribe
   [conn [_ ticker]]
-  {:event "subscribe"
-   :channel "book"
-   :symbol (:symbol (product ticker))
-   :prec "P0"
-   :freq "F0"})
+  (json/encode
+    {:event "subscribe"
+     :channel "book"
+     :symbol (:symbol (product ticker))
+     :prec "P0"
+     :freq "F0"}))
 
-(defmethod convert-outgoing-msg :unsubscribe
+(defmethod -convert-outgoing-msg :unsubscribe
   [conn [_ ticker]]
   (let [channel (chan-of-ticker conn ticker)]
-    {:event "unsubscribe"
-     :chanId channel}))
+    (json/encode
+      {:event "unsubscribe"
+       :chanId channel})))
 
-(defmethod convert-outgoing-msg :default
+(defmethod -convert-outgoing-msg :default
   [conn msg]
-  msg)
+  (json/encode msg))
 
 ;; Conf
 ;; {

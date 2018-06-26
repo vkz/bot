@@ -9,7 +9,12 @@
    [clojure.core.async.impl.protocols :refer [closed?] :rename {closed? chan-closed?}]
    [taoensso.timbre :as log]))
 
-(require '[exch :as exch :refer [conj-some]] :reload)
+(require
+  '[exch
+    :as exch
+    :refer [convert-incomming-msg
+            convert-outgoing-msg]]
+  :reload)
 
 (declare send-msg)
 
@@ -17,12 +22,14 @@
   ;; [exchange-name Channel Atom]
 
   exch/ConnectionProtocol
+  (convert-incomming-msg [conn msg] msg)
+  (convert-outgoing-msg [conn msg] msg)
   (connect [conn] (reset! status true) conn)
   (disconnect [conn] (reset! status false))
   (connected? [conn] @status)
-  (send-out [conn msg] (send-msg conn msg))
+  (send-out [conn msg] (->> msg (convert-outgoing-msg conn) (send-msg conn)))
   ;; TODO validate against out-message spec
-  (send-in [conn msg] (async/put! in msg))
+  (send-in [conn msg] (async/put! in (convert-incomming-msg conn msg)))
   (conn-name [conn] :generic))
 
 (defn create-connection []

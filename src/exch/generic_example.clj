@@ -60,4 +60,6 @@
   ;; pong
   (send-in c [:pong {:cid 1234 :ts (timestamp)}])
 
+  (Thread/sleep 5000)
+
   (System/exit 0))
