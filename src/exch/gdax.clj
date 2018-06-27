@@ -92,21 +92,36 @@
              {"name" "ticker"
               "product_ids" ["ETH-BTC"]}]}
 
-;;** - snapshot
-
 (defn decimal-str? [v]
   (try
     (decimal v)
     (catch NumberFormatException _
       :clojure.spec.alpha/invalid)))
 
-;; TODO wonder if I should be doing the conformer trick here or defer it for
-;; later?
+(defn product-symbol->ticker? [v]
+  (let [p (Product. v)]
+    (if (get PRODUCTS p)
+      (ticker p)
+      :clojure.spec.alpha/invalid)))
+
+;; TODO While capturing :price and :size and converting to decimal with
+;; spec/conformer trick is nice, we essentially end up transforming back in the
+;; -convert-incomming-msg, then why do it here? E.g. we end-up doing:
+;; [price size] => {:price price :size size} => [price size]
 
 (spec/def ::bid
   (spec/spec
     (spec/cat :price (spec/conformer decimal-str?)
               :size (spec/conformer decimal-str?))))
+#_
+(spec/def ::bid
+  (spec/spec
+    (spec/tuple (spec/conformer decimal-str?)
+                (spec/conformer decimal-str?))))
+
+#_(spec/conform
+    ::bid
+    ["6500.11" "0.45054140"])
 
 (spec/def ::ask
   (spec/spec
@@ -130,6 +145,20 @@
 
 (spec/def ::message string?)
 
+(spec/def ::product_id
+  (spec/conformer product-symbol->ticker?))
+
+(spec/def ::product_ids
+  (spec/* ::product_id))
+
+;; (spec/def ::name #{"level2" "heartbeat" "ticker"})
+
+(spec/def ::channel
+  (spec/keys :req [::name ::product_ids]))
+
+(spec/def ::channels
+  (spec/* ::channel))
+
 (defmulti msg-type ::type)
 
 (defmethod msg-type "snapshot" [_]
@@ -141,34 +170,16 @@
 (defmethod msg-type "error" [_]
   (spec/keys :req [::type ::message]))
 
+(defmethod msg-type "subscriptions" [_]
+  (spec/keys :req [::type ::channels]))
+
+(defmethod msg-type "heartbeat" [_]
+  (spec/keys :req [::type ::product_id ::time]
+             :opt [::sequence ::last_trade_id]))
+
 (spec/def ::gdax-message
   (spec/multi-spec msg-type ::type))
 
-(spec/conform
-  ::gdax-message
-  (map-json-map
-    {"type" "snapshot"
-     "product_id" "BTC-EUR"
-     "bids" [["6500.11" "0.45054140"]]
-     "asks" [["6500.15" "0.57753524"]
-             ["6504.38" "0.5"]]}))
-
-(spec/conform
-  ::gdax-message
-  (map-json-map
-    {"type" "l2update"
-     "product_id" "BTC-EUR"
-     "changes"
-     [["buy" "6500.09" "0.84702376"]
-      ["sell" "6507.00" "1.88933140"]
-      ["sell" "6505.54" "1.12386524"]
-      ["sell" "6504.38" "0"]]}))
-
-(spec/conform
-  ::gdax-message
-  (map-json-map
-    {"type" "error"
-     "message" "error message"}))
 
 ;; // Request
 ;; // Subscribe to ETH-USD and ETH-EUR with the level2, heartbeat and ticker channels,
