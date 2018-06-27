@@ -23,7 +23,20 @@
              [deftest with-test is are testing use-fixtures]])
 
   (:import [java.text DateFormat SimpleDateFormat]
-           [java.util Date]))
+           [java.util Date]
+           [java.time Instant]))
+
+
+;; GDAX uses zoned TS with microseconds which old classes like SimpleDateFormat
+;; DateFormat and Date don't really handle. We need to use a more modern java.time
+;; library that ships with Jave 8 and above. E.g. this parses GDAX ISO 8601 ts
+;; without a problem:
+;;
+;; (Instant/parse "2014-11-07T22:19:28.578544Z")
+;;
+;; TODO Maybe worth switching to java.time all time work?
+;; https://docs.oracle.com/javase/9/docs/api/java/time/package-summary.html
+
 
 ;;* Utils
 (defn conj-some
