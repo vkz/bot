@@ -31,6 +31,8 @@
 
 (def ^:private URL "wss://ws-feed.gdax.com")
 
+(defrecord Product [symbol])
+
 ;; TODO Products vs Tickers part repeats almost verbatim for different exchanges.
 ;; Dry this.
 (def ^:private PRODUCTS
@@ -294,46 +296,40 @@
          "product_id" "BTC-USD"
          "time" "2014-11-07T22:19:28.578544Z"}))))
 
-;; // Request
-;; // Subscribe to ETH-USD and ETH-EUR with the level2, heartbeat and ticker channels,
-;; // plus receive the ticker entries for ETH-BTC and ETH-USD
-;; {
-;;     "type": "subscribe",
-;;     "product_ids": [
-;;         "ETH-USD",
-;;         "ETH-EUR"
-;;     ],
-;;     "channels": [
-;;         "level2",
-;;         "heartbeat",
-;;         {
-;;             "name": "ticker",
-;;             "product_ids": [
-;;                 "ETH-BTC",
-;;                 "ETH-USD"
-;;             ]
-;;         }
-;;     ]
-;;  }
+;;* Convert outgoing msg
 
-;; // Request
-;; {
-;;     "type": "unsubscribe",
-;;     "product_ids": [
-;;         "ETH-USD",
-;;         "ETH-EUR"
-;;     ],
-;;     "channels": ["ticker"]
-;;  }
+;; TODO I can actually define both -convert-incomming-msg and
+;; -convert-outgoing-msg as defmulti in (ns exch). Then each exchange specific ns
+;; would extend them with methods. I'd need a dispatch that takes exchange into
+;; account not merely tag: [(exch-name conn) tag]?
+(defmulti -convert-outgoing-msg (fn [conn [tag _]] tag))
 
-;; // Request
-;; {
-;;     "type": "unsubscribe",
-;;     "channels": ["heartbeat"]
-;;  }
+(defmethod -convert-outgoing-msg :subscribe
+  [conn [_ ticker]]
+  (json/encode
+    {:type "subscribe"
+     :product_ids [(-> ticker product :symbol)]
+     :channels ["level2"]}))
 
-;; // Request
-;; {
-;;     "type": "subscribe",
-;;     "channels": [{ "name": "heartbeat", "product_ids": ["ETH-EUR"] }]
-;;  }
+(defmethod -convert-outgoing-msg :heartbeat
+  [conn [_ ticker]]
+  (json/encode
+    {:type "subscribe"
+     :product_ids [(-> ticker product :symbol)]
+     :channels ["heartbeat"]}))
+
+#_
+(defmethod -convert-outgoing-msg :heartbeat
+  [conn [_ ticker]]
+  (json/encode
+    {:type "subscribe"
+     :channels [{:name "heartbeat"
+                 :product_ids [(-> ticker product :symbol)]}]}))
+
+(defmethod -convert-outgoing-msg :unsubscribe
+  [conn [_ ticker]]
+  (json/encode
+    {:type "unsubscribe"
+     :product_ids [(-> ticker product :symbol)]
+     :channels ["level2"
+                "heartbeat"]}))
