@@ -180,6 +180,119 @@
 (spec/def ::gdax-message
   (spec/multi-spec msg-type ::type))
 
+;;* Convert incomming msg
+
+(defmulti -convert-incomming-msg (fn [conn {tag ::type}] tag))
+
+(defmethod -convert-incomming-msg "snapshot"
+  [conn {bids ::bids
+         asks ::asks
+         ticker ::product_id}]
+  [:snapshot
+   {:ticker ticker
+    :snapshot
+    {:bids (map #(vector (:price %) (:size %)) bids)
+     :asks (map #(vector (:price %) (:size %)) asks)}}])
+
+(defmethod -convert-incomming-msg "l2update"
+  [conn {ticker ::product_id
+         changes ::changes}]
+  (let [{bids "buy"
+         asks "sell"}
+        (group-by :side changes)]
+    [:update
+     {:ticker ticker
+      :update
+      {:bids (map #(vector (:price %) (:size %)) bids)
+       :asks (map #(vector (:price %) (:size %)) asks)}}]))
+
+(defmethod -convert-incomming-msg "error"
+  [conn {message ::message}]
+  [:error {:message message}])
+
+(defn channel->subscribed-msgs
+  [{channel ::name
+    tickers ::product_ids}]
+  (letfn [(ticker->subscribed [ticker]
+            [:subscribed
+             {:ticker ticker
+              :channel channel}])]
+    (map ticker->subscribed tickers)))
+
+(defmethod -convert-incomming-msg "subscriptions"
+  [conn {channels ::channels}]
+  ;; GDAX allows to subscribe to multiple channels and products in one request, so
+  ;; the subscribtion confo may in general report multiple results. Every such
+  ;; result should generate one :subscribed msg. Although we handle GDAX's
+  ;; multiple case here our API should only ever allow one subscribtion per
+  ;; request i.e. ::channels key will be a sequence of just one confirmation,
+  ;; whose ::product_ids key will be a sequence of just one ticker.
+
+  ;; TODO either we return a single subscribed msg here (the first and only one)
+  ;; and report an error if there're more than one, or we handle a multi-msg
+  ;; return and sequentially put them on the wire somewhere in the (connect ...)
+  (mapcat channel->subscribed-msgs channels))
+
+(defmethod -convert-incomming-msg "heartbeat"
+  [conn {ticker ::product_id :as msg}]
+  [:heartbeat (assoc msg :ticker ticker)])
+
+(comment
+  (-convert-incomming-msg
+    'conn
+    (spec/conform
+      ::gdax-message
+      (map-json-map
+        {"type" "snapshot"
+         "product_id" "BTC-EUR"
+         "bids" [["6500.11" "0.45054140"]]
+         "asks" [["6500.15" "0.57753524"]
+                 ["6504.38" "0.5"]]})))
+
+  (-convert-incomming-msg
+    'conn
+    (spec/conform
+      ::gdax-message
+      (map-json-map
+        {"type" "l2update"
+         "product_id" "BTC-EUR"
+         "changes"
+         [["buy" "6500.09" "0.84702376"]
+          ["sell" "6507.00" "1.88933140"]
+          ["sell" "6505.54" "1.12386524"]
+          ["sell" "6504.38" "0"]]})))
+
+  (-convert-incomming-msg
+    'conn
+    (spec/conform
+      ::gdax-message
+      (map-json-map
+        {"type" "error"
+         "message" "error message"})))
+
+  (-convert-incomming-msg
+    'conn
+    (spec/conform
+      ::gdax-message
+      (map-json-map
+        {"type" "subscriptions"
+         "channels" [{"name" "level2"
+                      "product_ids" ["ETH-USD" "ETH-EUR"]}
+                     {"name" "heartbeat"
+                      "product_ids" ["ETH-USD" "ETH-EUR"]}
+                     {"name" "ticker"
+                      "product_ids" ["ETH-USD" "ETH-EUR" "ETH-BTC"]}]})))
+
+  (-convert-incomming-msg
+    'conn
+    (spec/conform
+      ::gdax-message
+      (map-json-map
+        {"type" "heartbeat"
+         "sequence" 90
+         "last_trade_id" 20
+         "product_id" "BTC-USD"
+         "time" "2014-11-07T22:19:28.578544Z"}))))
 
 ;; // Request
 ;; // Subscribe to ETH-USD and ETH-EUR with the level2, heartbeat and ticker channels,
@@ -198,35 +311,6 @@
 ;;             "product_ids": [
 ;;                 "ETH-BTC",
 ;;                 "ETH-USD"
-;;             ]
-;;         }
-;;     ]
-;;  }
-
-;; // Response
-;; {
-;;     "type": "subscriptions",
-;;     "channels": [
-;;         {
-;;             "name": "level2",
-;;             "product_ids": [
-;;                 "ETH-USD",
-;;                 "ETH-EUR"
-;;             ],
-;;         },
-;;         {
-;;             "name": "heartbeat",
-;;             "product_ids": [
-;;                 "ETH-USD",
-;;                 "ETH-EUR"
-;;             ],
-;;         },
-;;         {
-;;             "name": "ticker",
-;;             "product_ids": [
-;;                 "ETH-USD",
-;;                 "ETH-EUR",
-;;                 "ETH-BTC"
 ;;             ]
 ;;         }
 ;;     ]
@@ -252,13 +336,4 @@
 ;; {
 ;;     "type": "subscribe",
 ;;     "channels": [{ "name": "heartbeat", "product_ids": ["ETH-EUR"] }]
-;;  }
-
-;; // Heartbeat message
-;; {
-;;     "type": "heartbeat",
-;;     "sequence": 90,
-;;     "last_trade_id": 20,
-;;     "product_id": "BTC-USD",
-;;     "time": "2014-11-07T08:19:28.464459Z"
 ;;  }
