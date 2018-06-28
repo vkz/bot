@@ -179,21 +179,17 @@
   exch/ConnectionProtocol
   (convert-outgoing-msg [conn msg] (-convert-outgoing-msg conn msg))
   (convert-incomming-msg [conn msg]
-    (let [exch-msg
-          (spec/conform
-            ::message
-            (json/decode msg ns-keywordize))]
+    (let [msg (json/decode msg ns-keywordize)
+          exch-msg (spec/conform ::incomming-message msg)]
 
       (if (spec/invalid? exch-msg)
 
-        (do
-          ;; log error unrecognized message and drop it - don't break the system
-          (log/error
-            "Received message did not conform to spec\n"
-            (with-out-str
-              (spec/explain-data
-                ::message
-                msg))))
+        (log/error
+          "Received message did not conform to spec\n"
+          (with-out-str
+            (spec/explain-data
+              ::incomming-message
+              msg)))
 
         (-convert-incomming-msg conn exch-msg))))
   (connect [conn]
@@ -312,7 +308,7 @@
   (spec/multi-spec event-type ::event))
 
 ;;** - message
-(spec/def ::message
+(spec/def ::incomming-message
   (spec/or
     :event ::event-msg
     :heartbeat ::hb-msg
