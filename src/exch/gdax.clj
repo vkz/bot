@@ -77,8 +77,97 @@
       nil)))
 
 ;;* State
+(defprotocol StateProtocol
+  (set-stream [state stream])
+  (toggle-status [state] [state status]))
+
+(defrecord State [stream status]
+  StateProtocol
+  (set-stream [state stream] (State. stream status))
+  (toggle-status [state] (State. stream (not status)))
+  (toggle-status [state status] (State. stream status)))
+
+(defn clean-state [] (State. nil false))
 
 ;;* Connection
+(declare
+  -convert-incomming-msg
+  -convert-outgoing-msg)
+
+(defrecord Connection [in out state]
+  StateProtocol
+  (set-stream [conn stream] (swap! state set-stream stream) conn)
+  (toggle-status [conn] (swap! state toggle-status))
+  (toggle-status [conn status] (swap! state toggle-status status))
+
+  exch/ConnectionProtocol
+  (convert-outgoing-msg [conn msg] (-convert-outgoing-msg conn msg))
+  (convert-incomming-msg [conn msg]
+    (let [msg (json/decode msg ns-keywordize)
+          exch-msg (spec/conform ::incomming-message msg)]
+
+      (if (spec/invalid? exch-msg)
+
+        (log/error
+          "Received message did not conform to spec\n"
+          (with-out-str
+            (spec/explain-data
+              ::incomming-message
+              msg)))
+
+        (-convert-incomming-msg conn exch-msg))))
+  (connect [conn]
+    (let [exch-stream
+          @(http/websocket-client
+             URL
+             {:max-frame-payload 1e6
+              :max-frame-size 1e6})
+
+          in-stream
+          ;; sink of msgs from exchange for users to consume
+          (s/->sink in)
+
+          out-stream
+          ;; source of user msgs to send to exchange
+          (s/->source out)
+
+          ;; NOTE connect-via requires an explicit s/put! in the via-fn!
+
+          _
+          ;; exchange <= out <= user
+          (s/connect-via out-stream
+                         (fn [msg]
+                           (->> msg
+                                ;; exch/msg
+                                (convert-outgoing-msg conn)
+                                ;; json
+                                (s/put! exch-stream)))
+                         exch-stream)
+
+          _
+          ;; exchange => in => user
+          (s/connect-via exch-stream
+                         (fn [msg]
+                           (->> msg
+                                ;; json
+                                (convert-incomming-msg conn)
+                                ;; exch/msg
+                                (s/put-all! in-stream)))
+                         in-stream)]
+      ;; TODO Maybe have a proc sending out [:ping] to keep alive
+      (-> conn
+          (set-stream exch-stream)
+          (toggle-status))))
+  (disconnect [conn] (a/close! in) (toggle-status conn))
+  (connected? [conn] (:status @state))
+  (send-out [conn msg] (a/put! (:out conn) msg))
+  (send-in [conn msg] (a/put! (:in conn) msg))
+  (conn-name [conn] (keyword NSNAME)))
+
+(defn create-connection []
+  (let [in (a/chan 1)
+        out (a/chan 1)]
+    (Connection. in out (atom (clean-state)))))
 
 ;;* Message specs
 
@@ -179,22 +268,27 @@
   (spec/keys :req [::type ::product_id ::time]
              :opt [::sequence ::last_trade_id]))
 
-(spec/def ::gdax-message
+(spec/def ::incomming-message
   (spec/multi-spec msg-type ::type))
 
 ;;* Convert incomming msg
 
+;; Because incomming msg may encode multiple exch-msgs e.g. gdax "subscriptions"
+;; we'll return a sequence of messages to be more robust even if in most cases
+;; incomming msg will produce a single exch-msg. Signature is therefore:
+;; (-> msg [exch-msg ...])
 (defmulti -convert-incomming-msg (fn [conn {tag ::type}] tag))
 
 (defmethod -convert-incomming-msg "snapshot"
   [conn {bids ::bids
          asks ::asks
          ticker ::product_id}]
-  [:snapshot
-   {:ticker ticker
-    :snapshot
-    {:bids (map #(vector (:price %) (:size %)) bids)
-     :asks (map #(vector (:price %) (:size %)) asks)}}])
+  (vector
+    [:snapshot
+     {:ticker ticker
+      :snapshot
+      {:bids (map #(vector (:price %) (:size %)) bids)
+       :asks (map #(vector (:price %) (:size %)) asks)}}]))
 
 (defmethod -convert-incomming-msg "l2update"
   [conn {ticker ::product_id
@@ -202,15 +296,17 @@
   (let [{bids "buy"
          asks "sell"}
         (group-by :side changes)]
-    [:update
-     {:ticker ticker
-      :update
-      {:bids (map #(vector (:price %) (:size %)) bids)
-       :asks (map #(vector (:price %) (:size %)) asks)}}]))
+    (vector
+      [:update
+       {:ticker ticker
+        :update
+        {:bids (map #(vector (:price %) (:size %)) bids)
+         :asks (map #(vector (:price %) (:size %)) asks)}}])))
 
 (defmethod -convert-incomming-msg "error"
   [conn {message ::message}]
-  [:error {:message message}])
+  (vector
+    [:error {:message message}]))
 
 (defn channel->subscribed-msgs
   [{channel ::name
@@ -237,7 +333,8 @@
 
 (defmethod -convert-incomming-msg "heartbeat"
   [conn {ticker ::product_id :as msg}]
-  [:heartbeat (assoc msg :ticker ticker)])
+  (vector
+    [:heartbeat (assoc msg :ticker ticker)]))
 
 (comment
   (-convert-incomming-msg
@@ -284,6 +381,14 @@
                       "product_ids" ["ETH-USD" "ETH-EUR"]}
                      {"name" "ticker"
                       "product_ids" ["ETH-USD" "ETH-EUR" "ETH-BTC"]}]})))
+  (-convert-incomming-msg
+    'conn
+    (spec/conform
+      ::gdax-message
+      (map-json-map
+        {"type" "subscriptions"
+         "channels" [{"name" "level2"
+                      "product_ids" ["BTC-USD"]}]})))
 
   (-convert-incomming-msg
     'conn
@@ -304,6 +409,9 @@
 ;; account not merely tag: [(exch-name conn) tag]?
 (defmulti -convert-outgoing-msg (fn [conn [tag _]] tag))
 
+;; TODO Be consistent and put out ns ::keyed maps, then
+;; (json/encode {::foo "foo" ::bar "bar"} {:key-fn name})
+
 (defmethod -convert-outgoing-msg :subscribe
   [conn [_ ticker]]
   (json/encode
@@ -311,6 +419,7 @@
      :product_ids [(-> ticker product :symbol)]
      :channels ["level2"]}))
 
+#_
 (defmethod -convert-outgoing-msg :heartbeat
   [conn [_ ticker]]
   (json/encode
@@ -318,7 +427,7 @@
      :product_ids [(-> ticker product :symbol)]
      :channels ["heartbeat"]}))
 
-#_
+;; TODO doesn't seem to work
 (defmethod -convert-outgoing-msg :heartbeat
   [conn [_ ticker]]
   (json/encode
@@ -328,8 +437,11 @@
 
 (defmethod -convert-outgoing-msg :unsubscribe
   [conn [_ ticker]]
+  ;; HACK Since GDAX doesn't appear to send :unsubscribed confo, we have to
+  ;; generate one for standard-handlers to handle.
+  (exch/send-in conn [:unsubscribed {:ticker ticker}])
+
   (json/encode
     {:type "unsubscribe"
      :product_ids [(-> ticker product :symbol)]
-     :channels ["level2"
-                "heartbeat"]}))
+     :channels ["level2" "heartbeat"]}))
