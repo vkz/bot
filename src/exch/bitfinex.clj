@@ -228,7 +228,7 @@
                                 ;; json
                                 (convert-incomming-msg conn)
                                 ;; exch/msg
-                                (s/put! in-stream)))
+                                (s/put-all! in-stream)))
                          in-stream)]
       ;; TODO Maybe have a proc sending out [:ping] to keep alive
       (-> conn
@@ -336,7 +336,8 @@
 
 (defmethod -convert-incomming-msg :heartbeat
   [conn msg]
-  (add-ticker-or-drop conn msg))
+  (vector
+    (add-ticker-or-drop conn msg)))
 
 (defn- snapshot->bids-asks [payload]
   (let [{:keys [bids asks]}
@@ -380,20 +381,22 @@
 
 (defmethod -convert-incomming-msg :snapshot
   [conn [tag payload]]
-  (add-ticker-or-drop
-    conn
-    [tag (update
-           payload
-           :snapshot snapshot->bids-asks)]))
+  (vector
+    (add-ticker-or-drop
+      conn
+      [tag (update
+             payload
+             :snapshot snapshot->bids-asks)])))
 
 (defmethod -convert-incomming-msg :update
   [conn [_ {update :update
             :as m}]]
-  (add-ticker-or-drop
-    conn
-    [:update
-     (assoc m :update
-            (update->bids-asks [update]))]))
+  (vector
+    (add-ticker-or-drop
+      conn
+      [:update
+       (assoc m :update
+              (update->bids-asks [update]))])))
 
 (defmethod -convert-incomming-msg :event [conn [_ m]]
   (-convert-incomming-event-msg conn m))
@@ -403,10 +406,11 @@
 
 (defmethod -convert-incomming-event-msg "pong"
   [conn {ts ::ts cid ::cid :as m}]
-  [:pong
-   (-> m
-       (assoc :timestamp (timestamp ts))
-       (assoc :id cid))])
+  (vector
+    [:pong
+     (-> m
+         (assoc :timestamp (timestamp ts))
+         (assoc :id cid))]))
 
 (defmethod -convert-incomming-event-msg "info"
   [conn {event ::event code ::code msg ::msg :as m}]
@@ -435,7 +439,8 @@
             (assoc-some :reason reason)
             (assoc-some :tag orig-tag))]
 
-    [tag payload]))
+    (vector
+      [tag payload])))
 
 (defmethod -convert-incomming-event-msg "subscribed"
   [conn {pair ::pair channel ::chanId :as m}]
@@ -445,26 +450,28 @@
 
     (add-chan conn channel ticker)
     (log/info "Subscribed to ticker " ticker)
-    [:subscribed
-     (assoc m :ticker ticker)]))
+    (vector
+      [:subscribed
+       (assoc m :ticker ticker)])))
 
 (defmethod -convert-incomming-event-msg "unsubscribed"
   [conn {channel ::chanId :as m}]
-  (if-let [ticker (ticker-of-chan conn channel)]
+  (vector
+    (if-let [ticker (ticker-of-chan conn channel)]
 
-    (do
-      (rm-chan conn channel)
-      (log/info "Unsubscribed ticker " ticker)
-      [:unsubscribed
-       (assoc m :ticker ticker)])
+      (do
+        (rm-chan conn channel)
+        (log/info "Unsubscribed ticker " ticker)
+        [:unsubscribed
+         (assoc m :ticker ticker)])
 
-    (do
-      (let [reason (str "Ticker for channel " channel " not found")]
-        (log/error reason)
-        [:drop
-         (-> m
-             (assoc :tag :unsubscribed)
-             (assoc :reason reason))]))))
+      (do
+        (let [reason (str "Ticker for channel " channel " not found")]
+          (log/error reason)
+          [:drop
+           (-> m
+               (assoc :tag :unsubscribed)
+               (assoc :reason reason))])))))
 
 (defmethod -convert-incomming-event-msg "error"
   [conn {code ::code msg ::msg :as m}]
@@ -480,7 +487,8 @@
       "Received error code from server:"
       payload)
 
-    [tag payload]))
+    (vector
+      [tag payload])))
 
 ;;* Convert outgoing msg
 
