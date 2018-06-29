@@ -19,7 +19,8 @@
            [ticker ticker-kw base commodity currency
             timestamp decimal conj-some
             convert-incomming-msg
-            convert-outgoing-msg]]
+            convert-outgoing-msg
+            advise unadvise apply-advice ad]]
          :reload)
 
 ;;* Utils & constants
@@ -77,28 +78,42 @@
       nil)))
 
 ;;* State
+
 (defprotocol StateProtocol
   (set-stream [state stream])
-  (toggle-status [state] [state status]))
+  (toggle-status [state] [state status])
+  (state-advise [state advice])
+  (state-unadvise [state advice]))
 
-(defrecord State [stream status]
+(defrecord State [stream status ads]
   StateProtocol
-  (set-stream [state stream] (State. stream status))
-  (toggle-status [state] (State. stream (not status)))
-  (toggle-status [state status] (State. stream status)))
+  (set-stream [state stream] (State. stream status ads))
+  (toggle-status [state] (State. stream (not status) ads))
+  (toggle-status [state status] (State. stream status ads))
+  (state-advise [state advice] (State. stream status (update-in ads (:path advice) conj advice)))
+  (state-unadvise [state advice] (State. stream status (update-in ads (:path advice) (fn [ad-vec] (->> ad-vec (remove #(= % advice)) vec))))))
 
-(defn clean-state [] (State. nil false))
+(defn clean-state []
+  (State.
+    nil
+    false
+    {:before {:incomming []
+              :outgoing []}
+     :after {:incomming []
+             :outgoing []}}))
 
 ;;* Connection
 (declare
   -convert-incomming-msg
   -convert-outgoing-msg)
 
-(defrecord Connection [in out state]
+(defrecord Connection [in out state stub-in]
   StateProtocol
   (set-stream [conn stream] (swap! state set-stream stream) conn)
   (toggle-status [conn] (swap! state toggle-status))
   (toggle-status [conn status] (swap! state toggle-status status))
+  (state-advise [conn advice] (swap! state state-advise advice))
+  (state-unadvise [conn advice] (swap! state state-unadvise advice))
 
   exch/ConnectionProtocol
   (convert-outgoing-msg [conn msg] (-convert-outgoing-msg conn msg))
@@ -116,6 +131,26 @@
               msg)))
 
         (-convert-incomming-msg conn exch-msg))))
+
+  (advise [conn advice] (state-advise conn advice) conn)
+  (unadvise [conn advice] (state-unadvise conn advice) conn)
+  (apply-advice [conn ad-path msg]
+    (reduce (fn ad-do-it [msg advice] ((:fn advice) conn msg))
+            msg
+            (get-in @state
+                    (case ad-path
+                      [:before :incomming]
+                      [:ads :before :incomming]
+
+                      [:after :incomming]
+                      [:ads :after :incomming]
+
+                      [:before :outgoing]
+                      [:ads :before :outgoing]
+
+                      [:after :outgoing]
+                      [:ads :after :outgoing]))))
+
   (connect [conn]
     (let [exch-stream
           @(http/websocket-client
@@ -139,7 +174,9 @@
                          (fn [msg]
                            (->> msg
                                 ;; exch/msg
+                                (apply-advice conn [:before :outgoing])
                                 (convert-outgoing-msg conn)
+                                (apply-advice conn [:after :outgoing])
                                 ;; json
                                 (s/put! exch-stream)))
                          exch-stream)
@@ -150,13 +187,42 @@
                          (fn [msg]
                            (->> msg
                                 ;; json
+                                (apply-advice conn [:before :incomming])
                                 (convert-incomming-msg conn)
+                                ;; => [msg ...], therefore
+                                (mapv #(apply-advice conn [:after :incomming] %))
                                 ;; exch/msg
                                 (s/put-all! in-stream)))
-                         in-stream)]
+                         in-stream
+                         { ;; close exch-stream if in-stream is closed
+                          :upstream? true
+                          ;; do not close in-stream if exch-stream source
+                          :downstream? false})
+
+          stub-exch-source
+          (s/->source stub-in)
+
+          _
+          (s/connect-via stub-exch-source
+                         (fn [msg]
+                           (->> msg
+                                ;; json
+                                (apply-advice conn [:before :incomming])
+                                (convert-incomming-msg conn)
+                                ;; => [msg ...], therefore
+                                (mapv #(apply-advice conn [:after :incomming] %))
+                                ;; exch/msg
+                                (s/put-all! in-stream)))
+                         in-stream
+                         { ;; close exch-stream if in-stream is closed
+                          :upstream? true
+                          ;; do not close in-stream if exch-stream source
+                          :downstream? false})]
       ;; TODO Maybe have a proc sending out [:ping] to keep alive
       (-> conn
           (set-stream exch-stream)
+          ;; TODO add stub-exch-source to State
+          ;; (set-stub-exch-source stub-exch-source)
           (toggle-status))))
   (disconnect [conn] (a/close! in) (toggle-status conn))
   (connected? [conn] (:status @state))
@@ -166,8 +232,9 @@
 
 (defn create-connection []
   (let [in (a/chan 1)
-        out (a/chan 1)]
-    (Connection. in out (atom (clean-state)))))
+        out (a/chan 1)
+        stub-in (a/chan 1)]
+    (Connection. in out (atom (clean-state)) stub-in)))
 
 ;;* Message specs
 

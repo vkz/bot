@@ -134,6 +134,36 @@
 #_((juxt ticker-kw ticker base commodity currency) (ticker :usd/btc))
 
 ;;* Connection
+
+(defrecord Advice [path fn])
+;; (Advice. [:before :incomming] (fn [conn msg]))
+;; (Advice. [:after :incomming] (fn [conn msg]))
+;; (Advice. [:before :outgoing] (fn [conn msg]))
+;; (Advice. [:after :outgoing] (fn [conn msg]))
+
+(spec/def ::defadvice-args
+  (spec/cat :name symbol?
+            :path (spec/* keyword?)
+            :bindings vector?
+            :body (spec/* (constantly true))))
+
+(defmacro defadvice [& args]
+  (let [{:keys [name path bindings body]}
+        (spec/conform ::defadvice-args args)]
+    `(def ~(symbol name)
+       (Advice.
+         ~path
+         (fn ~bindings ~@body)))))
+
+;; TODO spec/fdef for defadvice
+
+#_
+(defadvice print-advice :before :incomming [conn msg]
+  (pprint "hello")
+  msg)
+
+#_((:fn print-advice) 'conn :foo)
+
 (defprotocol ConnectionProtocol
   "Public methods that every exchange connection record must implement.
   Conn is a record, type or class that represents exchange connection.
@@ -161,7 +191,10 @@
   (convert-outgoing-msg [Conn msg]
     "Convert :exch/msg to the msg format of the exchange. Return JSON string.")
   (conn-name [Conn]
-    "Return connection name e.g. :bitfinex."))
+    "Return connection name e.g. :bitfinex.")
+  (advise [Conn advice])
+  (unadvise [Conn advice])
+  (apply-advice [Conn ad-path msg]))
 
 ;;* Book
 (defn empty-book [ticker]
