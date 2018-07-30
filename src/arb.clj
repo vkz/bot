@@ -1,4 +1,12 @@
-(ns arb)
+(ns arb
+  (:require
+   [clojure.test :refer [deftest is are]]))
+
+(require '[exch :as exch
+           :refer
+           [ticker ticker-kw base commodity currency
+            timestamp decimal conj-some]]
+         :reload)
 
 ;;* Arb
 
@@ -69,23 +77,19 @@
               (min bid-size
                    ask-size)
 
-              bid
-              [:buy bid-price (- bid-size trade-size)]
+              bid-update
+              {:bids [[(decimal bid-price) (decimal (- bid-size trade-size))]]
+               :asks []}
 
-              ask
-              [:sell ask-price (- ask-size trade-size)]
+              ask-update
+              {:bids []
+               :asks [[(decimal ask-price) (decimal (- ask-size trade-size))]]}
 
               bid-book
-              (update bid-book
-                      {:type :update
-                       :ticker ticker
-                       :changes [bid]})
+              (exch/update->book bid-book bid-update)
 
               ask-book
-              (update ask-book
-                      {:type :update
-                       :ticker ticker
-                       :changes [ask]})
+              (exch/update->book ask-book ask-update)
 
               buy-at
               ask-price
@@ -163,9 +167,9 @@
            ask-book :ask-book}
           (first arb-trades)
 
-          {currency :currency}
-          (ticker-pair
-           (:ticker bid-book))]
+          currency
+          (currency
+            (:ticker bid-book))]
       [(->> arb-trades
             (map (fn [{:keys [sell-at
                              buy-at
@@ -175,3 +179,53 @@
                        (* trade-size))))
             (apply +))
        currency])))
+
+(deftest arbitrage
+  (let [ticker (ticker :btc/eth)
+
+        bid-book (exch/snapshot->book
+                   (exch/empty-book ticker)
+                   {:bids [[6 1]
+                           [5 4]
+                           [4 1]
+                           [3 10]]
+                    :asks []
+                    :ticker ticker})
+        ask-book (exch/snapshot->book
+                   (exch/empty-book ticker)
+                   {:bids []
+                    :asks [[4 2]
+                           [4.5 4]
+                           [5 5]
+                           [6 10]]
+                    :ticker ticker})]
+
+
+    ;; calculating expected profit by hand for the above two books
+    ;; * size (- sell buy)
+    (is (= 4.3575M
+           (+
+             (* 1 (- (with-cost 'any :sell 6)
+                     (with-cost 'any :buy 4)))
+             (* 1 (- (with-cost 'any :sell 5)
+                     (with-cost 'any :buy 4)))
+             (* 3 (- (with-cost 'any :sell 5)
+                     (with-cost 'any :buy 4.5))))))
+    ;; NOTE incidentally were I to perform this calculation in Clojure's default
+    ;; double instead of decimal I'd get a result with rounding error:
+    ;; 4.3575000000000035, so yeah, don't use float for money!
+
+    (is (= (with-cost 'b :ask 4)
+           (with-cost 'b :buy 4)))
+
+
+    (is (= (with-cost 'b :sell 5)
+           (with-cost 'b :bid 5)))
+
+    (is (arb? bid-book ask-book))
+
+    (is (=
+          [4.3575M :btc]
+          (expect-profit
+            (arb bid-book
+                 ask-book))))))
