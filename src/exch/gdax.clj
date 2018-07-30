@@ -20,7 +20,7 @@
             timestamp decimal conj-some
             convert-incomming-msg
             convert-outgoing-msg
-            advise unadvise apply-advice ad]]
+            advise unadvise apply-advice]]
          :reload)
 
 ;;* Utils & constants
