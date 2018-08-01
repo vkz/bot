@@ -180,6 +180,62 @@
             (apply +))
        currency])))
 
+(defn run-arb
+  [ticker
+   {bid-conn :conn :as bid-exch}
+   {ask-conn :conn :as ask-exch}]
+
+  (when-not (connected? bid-conn) (connect bid-conn))
+  (when-not (connected? ask-conn) (connect ask-conn))
+
+  (let [bid-book (get-book bid-exch ticker)
+        ask-book (get-book ask-exch ticker)]
+    (book-sub bid-book)
+    (book-sub ask-book)
+    (let [bid-ch (async/chan)
+          ask-ch (async/chan)]
+      (book-watch bid-book :book-update (fn [_ _] (async/put! bid-ch :bids-updated)))
+      (book-watch ask-book :book-update (fn [_ _] (async/put! ask-ch :asks-updated)))
+      (async/go
+        (loop []
+          (let [[v ch] (async/alts! [bid-ch ask-ch])]
+            (condp = ch
+              ;; TODO log/debug instead
+              bid-ch (log/debug "Bid book updated")
+              ask-ch (log/debug "Ask book updated"))
+            (let [bid-snap (book-snapshot bid-book)
+                  ask-snap (book-snapshot ask-book)]
+
+              ;; NOTE Exchanges are symmetrical so we try both ways:
+              ;; bid-exch BUY -> ask-exch SELL
+              ;; ask-exch BUY -> bid-exch SELL
+
+              ;; TODO When arb discovered we need to route orders correctly! Atm
+              ;; we don't care which exch is BUY, which is SELL.
+              (when-some [arb-trades
+                          (or
+                            ;; direct order
+                            (arb bid-snap ask-snap)
+                            ;; reversed order
+                            (arb ask-snap bid-snap))]
+                ;; TODO Send email notification instead
+                (log/info "Possible arb of " (expect-profit arb-trades))))
+            (recur))))
+      (fn stop [& {unsub? :unsub?
+                  disconnect? :disconnect?
+                  :or {unsub? false
+                       disconnect? false}}]
+        (book-unwatch bid-book :book-update)
+        (book-unwatch ask-book :book-update)
+        (when unsub?
+          (book-unsub bid-book)
+          (book-unsub ask-book))
+        (when disconnect?
+          (disconnect bid-conn)
+          (disconnect ask-conn))))))
+
+;;* Tests
+
 (deftest arbitrage
   (let [ticker (ticker :btc/eth)
 
