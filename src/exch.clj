@@ -394,7 +394,7 @@ If state already has a book for that ticker, do nothing. Return Exch.")
 ;;* Standard handlers
 
 (defmulti handle-msg (fn [exch [tag {ticker :ticker}]]
-                       (log/info
+                       (log/debug
                          (format
                            "[%s] handling msg: %s"
                            (get-name exch)
@@ -402,14 +402,14 @@ If state already has a book for that ticker, do nothing. Return Exch.")
                        tag))
 
 (defmethod handle-msg :pong [exch [_ {cid :cid ts :ts}]]
-  (log/info "Received "
-            (with-out-str
-              (pprint
-                (conj-some
-                  [:pong]
-                  (-> nil
-                      (assoc-some :ts ts)
-                      (assoc-some :cid cid)))))))
+  (log/debug "Received "
+             (with-out-str
+               (pprint
+                 (conj-some
+                   [:pong]
+                   (-> nil
+                       (assoc-some :ts ts)
+                       (assoc-some :cid cid)))))))
 
 (defmethod handle-msg :subscribed [exch [_ {ticker :ticker}]]
   (-> exch

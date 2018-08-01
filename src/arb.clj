@@ -1,12 +1,10 @@
 (ns arb
   (:require
-   [clojure.test :refer [deftest is are]]))
+   [clojure.test :refer [deftest is are]]
+   [clojure.core.async :as async]
+   [taoensso.timbre :as log]))
 
-(require '[exch :as exch
-           :refer
-           [ticker ticker-kw base commodity currency
-            timestamp decimal conj-some]]
-         :reload)
+(require '[exch :as exch :refer :all])
 
 ;;* Arb
 
@@ -115,7 +113,9 @@
       (recur (:bid-book trade)
              (:ask-book trade)
              (conj trades trade))
-      trades)))
+      (if (empty? trades)
+        nil
+        trades))))
 
 (defn arb? [bid-book ask-book]
   (when-let [ticker
