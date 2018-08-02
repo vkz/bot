@@ -189,7 +189,10 @@
   (when-not (connected? ask-conn) (connect ask-conn))
 
   (let [bid-book (get-book bid-exch ticker)
-        ask-book (get-book ask-exch ticker)]
+        ask-book (get-book ask-exch ticker)
+        ticker-kw (ticker-kw ticker)
+        bid-exch-name (get-name bid-exch)
+        ask-exch-name (get-name ask-exch)]
     (book-sub bid-book)
     (book-sub ask-book)
     (let [bid-ch (async/chan)
@@ -201,8 +204,8 @@
           (let [[v ch] (async/alts! [bid-ch ask-ch])]
             (condp = ch
               ;; TODO log/debug instead
-              bid-ch (log/debug "Bid book updated")
-              ask-ch (log/debug "Ask book updated"))
+              bid-ch (log/debug (format "Bid book updated at %s for %s" bid-exch-name ticker-kw))
+              ask-ch (log/debug (format "Ask book updated at %s for %s" ask-exch-name ticker-kw)))
             (let [bid-snap (book-snapshot bid-book)
                   ask-snap (book-snapshot ask-book)]
 
