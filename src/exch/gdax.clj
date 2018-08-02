@@ -36,13 +36,18 @@
 ;; TODO Products vs Tickers part repeats almost verbatim for different exchanges.
 ;; Dry this.
 (def ^:private PRODUCTS
-  (->>
-    ["BTC-USD" "ETH-USD" "ETH-BTC" "LTC-USD" "LTC-BTC"
-     "ETH-BTC" "LTC-BTC" "BTC-EUR" "ETH-EUR" "ETH-BTC"
-     "LTC-EUR" "LTC-BTC" "BTC-GBP" "BTC-EUR" "ETH-BTC"
-     "ETH-EUR" "LTC-BTC" "LTC-EUR" "ETH-BTC" "LTC-BTC"]
-    (map ->Product)
-    (into #{})))
+  (->> ["ETH-BTC"
+        "BCH-BTC"
+        "LTC-BTC"
+        "BTC-USD"
+        "BTC-EUR"
+        "BTC-GBP"
+        "ETH-USD"
+        "ETH-EUR"
+        "LTC-USD"
+        "LTC-EUR"]
+       (map ->Product)
+       (into #{})))
 
 (extend-protocol exch/ITicker
 
