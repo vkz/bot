@@ -1,5 +1,6 @@
 (ns arb
   (:require
+   [medley.core :refer :all]
    [clojure.test :refer [deftest is are]]
    [clojure.core.async :as async]
    [taoensso.timbre :as log]))
@@ -14,7 +15,7 @@
 (defn with-cost [book side price]
   ;; TODO exchange+book => fee
   ;; hardcoding for now
-  (let [taker-fee (/ 0.3 100)
+  (let [taker-fee (/ 0.3M 100M)
         ;; withdrawal-fee 0
         ]
     (decimal
@@ -148,17 +149,49 @@
               ask-price)))))
 
 (defn match [arb-trades]
-  {:size    (->> arb-trades
-                 (map :trade-size)
-                 (apply +))
-   :buy-at  (->> arb-trades
-                 (map :buy-at)
-                 (apply max))
-   :sell-at (->> arb-trades
-                 (map :sell-at)
-                 (apply min))
-   :books   (select-keys (last arb-trades)
-                         [:bid-book :ask-book])})
+  (assoc-some
+    {:volume (->> arb-trades
+                  (map #(let [{:keys [trade-size buy-at sell-at]} %]
+                          {:buy-volume (* trade-size buy-at)
+                           :sell-volume (* trade-size sell-at)}))
+                  (reduce #(-> %1
+                               (update :buy-volume + (:buy-volume %2))
+                               (update :sell-volume + (:sell-volume %2)))
+                          {:buy-volume 0M
+                           :sell-volume 0M}))
+     :size          (->> arb-trades
+                         (map :trade-size)
+                         (apply +))
+     :clear-buy-at  (->> arb-trades
+                         (map :buy-at)
+                         (apply max))
+     :clear-sell-at (->> arb-trades
+                         (map :sell-at)
+                         (apply min))}
+    :ticker (some-> arb-trades first :bid-book :ticker ticker-kw)))
+
+#_
+(let [ticker (ticker :btc/eth)
+      ticker-kw (ticker-kw ticker)
+
+      bid-book (exch/snapshot->book
+                 (exch/empty-book ticker)
+                 {:bids [[6 1]
+                         [5 4]
+                         [4 1]
+                         [3 10]]
+                  :asks []
+                  :ticker ticker})
+      ask-book (exch/snapshot->book
+                 (exch/empty-book ticker)
+                 {:bids []
+                  :asks [[4 2]
+                         [4.5 4]
+                         [5 5]
+                         [6 10]]
+                  :ticker ticker})
+      arb-trades (arb bid-book ask-book)]
+  (match arb-trades))
 
 (defn expect-profit [arb-trades]
   (if (empty? arb-trades)
@@ -180,6 +213,12 @@
             (apply +))
        currency])))
 
+(defn profit-threshold [currency]
+  (get
+    {:btc 0.03M
+     :usd 200M}
+    currency))
+
 (defn run-arb
   [ticker
    {bid-conn :conn :as bid-exch}
@@ -195,8 +234,10 @@
         ask-exch-name (get-name ask-exch)]
     (book-sub bid-book)
     (book-sub ask-book)
-    (let [bid-ch (async/chan)
-          ask-ch (async/chan)]
+    (let [bid-ch (async/chan 100)
+          ask-ch (async/chan 100)]
+      ;; TODO Think I ought to test these with custom dropping channels to see if
+      ;; I'm actually keeping up with updates.
       (book-watch bid-book :book-update (fn [_ _] (async/put! bid-ch :bids-updated)))
       (book-watch ask-book :book-update (fn [_ _] (async/put! ask-ch :asks-updated)))
       (async/go
@@ -221,8 +262,15 @@
                             (arb bid-snap ask-snap)
                             ;; reversed order
                             (arb ask-snap bid-snap))]
-                ;; TODO Send email notification instead
-                (log/info "Possible arb of " (expect-profit arb-trades))))
+                (let [[profit currency] (expect-profit arb-trades)]
+                  (when (>= profit (profit-threshold currency))
+                    ;; TODO Send email notification instead
+                    (log/info
+                      (format
+                        "Possible arb of %s - trade %s of %s"
+                        [profit currency]
+                        (:volume (match arb-trades))
+                        ticker-kw))))))
             (recur))))
       (fn stop [& {unsub? :unsub?
                   disconnect? :disconnect?
