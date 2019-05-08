@@ -1,3 +1,5 @@
+;; Copyright (C) 2018, 2019 by Vlad Kozin
+
 (ns generic-example
   (:require [medley.core :refer :all]
             [manifold.stream :as s]

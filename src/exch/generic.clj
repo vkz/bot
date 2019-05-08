@@ -1,3 +1,5 @@
+;; Copyright (C) 2018, 2019 by Vlad Kozin
+
 (ns generic
   (:require
    [medley.core :refer :all]

@@ -1,3 +1,5 @@
+;; Copyright (C) 2018, 2019 by Vlad Kozin
+
 (ns bot
   (:require [cheshire.core :as json]
             [medley.core :refer :all]

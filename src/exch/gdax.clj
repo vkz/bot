@@ -1,3 +1,5 @@
+;; Copyright (C) 2018, 2019 by Vlad Kozin
+
 (ns gdax
   (:require [clojure.spec.alpha :as spec]
             [clojure.spec.gen.alpha :as gen]
