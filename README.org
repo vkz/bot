@@ -1,0 +1,25 @@
+* Bot
+
+*Bot* was a crypto-currency arbitrager that could talk to several exchanges
+including Bitfinex and GDAX.
+
+Gets brownie points for:
+- using /Clojure Spec/ to parse and validate protocol messages,
+- being fully asynchronous with [[https://github.com/ztellman/aleph][aleph]] and core.async talking over websocket,
+- accounting for typical fees (/but not slippage, no market microstructure!/) and
+  reporting only arb above the declared profit threshold,
+- leaning heavily on protocols and multi-methods, so could be quite extensible in
+  capable hands.
+
+#+begin_quote
+*Warning* the whole thing was written to prove a point. I'm releasing it cause I
+ just don't have any use for it atm. I'm quite unlikely to support the development
+ unless paid generously.
+#+end_quote
+
+* Installation
+
+Afraid you'll have to figure that one out. /deps.edn/ was just getting released
+and the whole Clojure ecosystem was a mess (don't even get me started on the
+/project.clj/ nonsense). I just took /deps.edn/ for a test drive and had to hack a
+bunch of Emacs Lisp to make it work with Emacs. It's all fuzzy now.
